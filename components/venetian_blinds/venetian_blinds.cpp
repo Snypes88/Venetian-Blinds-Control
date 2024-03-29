@@ -122,19 +122,19 @@ void VenetianBlinds::control(const CoverCall &call) {
   }
   
   if (this->power_start_time_ > 0) {  
-    if (this->current_operation == COVER_OPERATION_OPENING && this->position == 1) {  
+    if (this->current_operation == COVER_OPERATION_OPENING && this->power_up_sensor_->state < threshold) {  
       this->open_duration = millis() - this->power_start_time_;  
       if (this->open_duration_sensor_ != nullptr) {  
         this->open_duration_sensor_->publish_state(this->open_duration);  
       }  
-    } else if (this->current_operation == COVER_OPERATION_CLOSING && this->position == 0) {  
+    } else if (this->current_operation == COVER_OPERATION_CLOSING && this->power_down_sensor_->state < threshold) {  
       this->close_duration = millis() - this->power_start_time_;  
       if (this->close_duration_sensor_ != nullptr) {  
         this->close_duration_sensor_->publish_state(this->close_duration);  
       }  
     }  
   }  
-}
+} 
 
 
 }  
