@@ -48,3 +48,13 @@ async def to_code(config):
     cg.add(var.set_tilt_duration(config[CONF_TILT_DURATION]))
     cg.add(var.set_actuator_activation_duration(config[CONF_ACTUATOR_ACTIVATION_DURATION]))
     cg.add(var.set_assumed_state(config[CONF_ASSUMED_STATE]))
+
+def venetian_blinds_to_code(config):  
+  # existing code...  
+  
+  cg.add(cg.App.register_component(var, config))  
+  
+  if CONF_AUTO_DETECT_ENDSTOPS in config:  
+    detect_action = automation.build_automation(var.get_auto_detect_endstops_trigger(), [],  
+                                                config[CONF_AUTO_DETECT_ENDSTOPS])  
+    cg.add(detect_action)  

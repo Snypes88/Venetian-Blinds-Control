@@ -122,17 +122,25 @@ void VenetianBlinds::control(const CoverCall &call) {
   }
   
   if (this->power_start_time_ > 0) {  
-    if (this->current_operation == COVER_OPERATION_OPENING) {  
+    if (this->current_operation == COVER_OPERATION_OPENING && this->position == 1) {  
       this->open_duration = millis() - this->power_start_time_;  
-    } else if (this->current_operation == COVER_OPERATION_CLOSING) {  
+      if (this->open_duration_sensor_ != nullptr) {  
+        this->open_duration_sensor_->publish_state(this->open_duration);  
+      }  
+    } else if (this->current_operation == COVER_OPERATION_CLOSING && this->position == 0) {  
       this->close_duration = millis() - this->power_start_time_;  
+      if (this->close_duration_sensor_ != nullptr) {  
+        this->close_duration_sensor_->publish_state(this->close_duration);  
+      }  
     }  
-    this->power_start_time_ = 0;  
   }  
+}
+
+
 }  
   
-
 }
+
 
 void VenetianBlinds::loop() {
   if (this->current_operation == COVER_OPERATION_IDLE)
@@ -268,6 +276,34 @@ void VenetianBlinds::recompute_position_() {
 
   this->last_recompute_time_ = now;
 }
+
+void VenetianBlinds::auto_detect_endstops() {  
+  // Close the cover  
+  this->control(CoverCall::get_closing());  
+  
+  // Wait for the cover to reach the endstop  
+  while (this->position > 0) {  
+    delay(100);  
+  }  
+  
+  // Record the close duration  
+  this->close_duration = millis() - this->power_start_time_;  
+  
+  // Open the cover  
+  this->control(CoverCall::get_opening());  
+  
+  // Wait for the cover to reach the endstop  
+  while (this->position < 1) {  
+    delay(100);  
+  }  
+  
+  // Record the open duration  
+  this->open_duration = millis() - this->power_start_time_;  
+  
+  // Close the cover again  
+  this->control(CoverCall::get_closing());  
+}  
+
 
 } // namespace venetian_blinds
 } // namespace esphome

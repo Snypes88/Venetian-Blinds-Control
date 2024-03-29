@@ -25,6 +25,17 @@ public:
   void set_power_up(sensor::Sensor *sensor) { this->power_up_ = sensor; }  
   void set_power_down(sensor::Sensor *sensor) { this->power_down_ = sensor; }  
 
+  void auto_detect_endstops();  
+
+  void set_open_duration_sensor(sensor::Sensor *open_duration_sensor) {  
+    open_duration_sensor_ = open_duration_sensor;  
+  }  
+
+  void set_close_duration_sensor(sensor::Sensor *close_duration_sensor) {  
+    close_duration_sensor_ = close_duration_sensor;  
+  }    
+
+
 protected:
   Trigger<> *open_trigger{new Trigger<>()};
   Trigger<> *close_trigger{new Trigger<>()};
@@ -56,7 +67,12 @@ private:
 
   sensor::Sensor *power_up_{nullptr};  
   sensor::Sensor *power_down_{nullptr};  
-  uint32_t power_start_time_{0};  
+  uint32_t power_start_time_{0}; 
+
+  sensor::Sensor *open_duration_sensor_{nullptr};  
+  sensor::Sensor *close_duration_sensor_{nullptr}; 
+  
+
 };
 
 } // namespace venetian_blinds
