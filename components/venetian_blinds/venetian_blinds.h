@@ -2,6 +2,7 @@
 #include "esphome/components/cover/cover.h"
 #include "esphome/core/automation.h"
 #include "esphome/core/component.h"
+#include "esphome/components/sensor/sensor.h"  
 
 namespace esphome {
 namespace venetian_blinds {
