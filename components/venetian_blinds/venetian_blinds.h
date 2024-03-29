@@ -22,6 +22,9 @@ public:
   void set_actuator_activation_duration(uint32_t actuator_activation) { this->actuator_activation_duration = actuator_activation; }
   void set_assumed_state(bool value) { this->assumed_state = value; }
 
+  void set_power_up(sensor::Sensor *sensor) { this->power_up_ = sensor; }  
+  void set_power_down(sensor::Sensor *sensor) { this->power_down_ = sensor; }  
+
 protected:
   Trigger<> *open_trigger{new Trigger<>()};
   Trigger<> *close_trigger{new Trigger<>()};
@@ -50,6 +53,10 @@ private:
 
   Trigger<> *prev_command_trigger_{nullptr};
   cover::CoverOperation last_operation_{cover::COVER_OPERATION_OPENING};
+
+  sensor::Sensor *power_up_{nullptr};  
+  sensor::Sensor *power_down_{nullptr};  
+  uint32_t power_start_time_{0};  
 };
 
 } // namespace venetian_blinds

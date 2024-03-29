@@ -45,6 +45,34 @@ void VenetianBlinds::setup() {
       this->position; // position factor should be same for both open and close
                       // even if both durations are different
   this->exact_tilt_ = this->tilt_duration * this->tilt;
+
+// NEW CODE!!
+
+  if (this->power_up_ != nullptr) {  
+    this->power_up_->add_on_state_callback([this](float state) {  
+      if (state > 100.0) {  
+        this->power_start_time_ = millis();  
+      } else if (state < 10.0 && this->power_start_time_ > 0) {  
+        this->open_duration = millis() - this->power_start_time_;  
+        this->power_start_time_ = 0;  
+      }  
+    });  
+  }  
+  
+  if (this->power_down_ != nullptr) {  
+    this->power_down_->add_on_state_callback([this](float state) {  
+      if (state > 100.0) {  
+        this->power_start_time_ = millis();  
+      } else if (state < 10.0 && this->power_start_time_ > 0) {  
+        this->close_duration = millis() - this->power_start_time_;  
+        this->power_start_time_ = 0;  
+      }  
+    });  
+  }  
+// NEW CODE END!!
+
+}  
+
 }
 
 CoverTraits VenetianBlinds::get_traits() {
@@ -92,6 +120,18 @@ void VenetianBlinds::control(const CoverCall &call) {
       this->start_direction_(operation);
     }
   }
+  
+  if (this->power_start_time_ > 0) {  
+    if (this->current_operation == COVER_OPERATION_OPENING) {  
+      this->open_duration = millis() - this->power_start_time_;  
+    } else if (this->current_operation == COVER_OPERATION_CLOSING) {  
+      this->close_duration = millis() - this->power_start_time_;  
+    }  
+    this->power_start_time_ = 0;  
+  }  
+}  
+  
+
 }
 
 void VenetianBlinds::loop() {
@@ -113,6 +153,14 @@ void VenetianBlinds::loop() {
     this->publish_state(false);
     this->last_publish_time_ = now;
   }
+
+  if (this->power_start_time_ > 0) {  
+    if (this->current_operation == COVER_OPERATION_OPENING) {  
+      this->open_duration = millis() - this->power_start_time_;  
+    } else if (this->current_operation == COVER_OPERATION_CLOSING) {  
+      this->close_duration = millis() - this->power_start_time_;  
+    }  
+
 }
 
 void VenetianBlinds::stop_prev_trigger_() {
