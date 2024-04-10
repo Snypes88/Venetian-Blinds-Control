@@ -45,34 +45,6 @@ void VenetianBlinds::setup() {
       this->position; // position factor should be same for both open and close
                       // even if both durations are different
   this->exact_tilt_ = this->tilt_duration * this->tilt;
-
-// NEW CODE!!
-
-  if (this->power_up_ != nullptr) {  
-    this->power_up_->add_on_state_callback([this](float state) {  
-      if (state > 100.0) {  
-        this->power_start_time_ = millis();  
-      } else if (state < 10.0 && this->power_start_time_ > 0) {  
-        this->open_duration = millis() - this->power_start_time_;  
-        this->power_start_time_ = 0;  
-      }  
-    });  
-  }  
-  
-  if (this->power_down_ != nullptr) {  
-    this->power_down_->add_on_state_callback([this](float state) {  
-      if (state > 100.0) {  
-        this->power_start_time_ = millis();  
-      } else if (state < 10.0 && this->power_start_time_ > 0) {  
-        this->close_duration = millis() - this->power_start_time_;  
-        this->power_start_time_ = 0;  
-      }  
-    });  
-  }  
-// NEW CODE END!!
-
-}  
-
 }
 
 CoverTraits VenetianBlinds::get_traits() {
@@ -120,56 +92,36 @@ void VenetianBlinds::control(const CoverCall &call) {
       this->start_direction_(operation);
     }
   }
+}
+
+void VenetianBlinds::loop() {  
+  if (this->current_operation == COVER_OPERATION_IDLE)  
+    return;  
   
-  if (this->power_start_time_ > 0) {  
-    if (this->current_operation == COVER_OPERATION_OPENING && this->power_up_sensor_->state < threshold) {  
-      this->open_duration = millis() - this->power_start_time_;  
-      if (this->open_duration_sensor_ != nullptr) {  
-        this->open_duration_sensor_->publish_state(this->open_duration);  
-      }  
-    } else if (this->current_operation == COVER_OPERATION_CLOSING && this->power_down_sensor_->state < threshold) {  
-      this->close_duration = millis() - this->power_start_time_;  
-      if (this->close_duration_sensor_ != nullptr) {  
-        this->close_duration_sensor_->publish_state(this->close_duration);  
-      }  
-    }  
+  const uint32_t now = millis();  
+  
+  // Recompute position every loop cycle  
+  this->recompute_position_();  
+  
+  if (this->is_at_target_()) {  
+    this->start_direction_(COVER_OPERATION_IDLE);  
+    this->publish_state();  
   }  
-} 
-
-
-}  
   
-}
+  // Send current position every second  
+  if (now - this->last_publish_time_ > 1000) {  
+    this->publish_state(false);  
+    this->last_publish_time_ = now;  
+  }  
+  
+  // Update endstop sensors  
+  bool is_at_open_endstop = this->position >= 1.0f;  
+  this->is_at_open_endstop_sensor_->publish_state(is_at_open_endstop);  
+  
+  bool is_at_closed_endstop = this->position <= 0.0f;  
+  this->is_at_closed_endstop_sensor_->publish_state(is_at_closed_endstop);  
+}  
 
-
-void VenetianBlinds::loop() {
-  if (this->current_operation == COVER_OPERATION_IDLE)
-    return;
-
-  const uint32_t now = millis();
-
-  // Recompute position every loop cycle
-  this->recompute_position_();
-
-  if (this->is_at_target_()) {
-    this->start_direction_(COVER_OPERATION_IDLE);
-    this->publish_state();
-  }
-
-  // Send current position every second
-  if (now - this->last_publish_time_ > 1000) {
-    this->publish_state(false);
-    this->last_publish_time_ = now;
-  }
-
-  if (this->power_start_time_ > 0) {  
-    if (this->current_operation == COVER_OPERATION_OPENING) {  
-      this->open_duration = millis() - this->power_start_time_;  
-    } else if (this->current_operation == COVER_OPERATION_CLOSING) {  
-      this->close_duration = millis() - this->power_start_time_;  
-    }  
-
-}
 
 void VenetianBlinds::stop_prev_trigger_() {
   if (this->prev_command_trigger_ != nullptr) {
@@ -276,34 +228,6 @@ void VenetianBlinds::recompute_position_() {
 
   this->last_recompute_time_ = now;
 }
-
-void VenetianBlinds::auto_detect_endstops() {  
-  // Close the cover  
-  this->control(CoverCall::get_closing());  
-  
-  // Wait for the cover to reach the endstop  
-  while (this->position > 0) {  
-    delay(100);  
-  }  
-  
-  // Record the close duration  
-  this->close_duration = millis() - this->power_start_time_;  
-  
-  // Open the cover  
-  this->control(CoverCall::get_opening());  
-  
-  // Wait for the cover to reach the endstop  
-  while (this->position < 1) {  
-    delay(100);  
-  }  
-  
-  // Record the open duration  
-  this->open_duration = millis() - this->power_start_time_;  
-  
-  // Close the cover again  
-  this->control(CoverCall::get_closing());  
-}  
-
 
 } // namespace venetian_blinds
 } // namespace esphome
