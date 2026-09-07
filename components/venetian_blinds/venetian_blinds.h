@@ -60,7 +60,7 @@ private:
     this->close_net_duration_ = this->close_duration - tilt_and_activation_duration;
     // Keep position/tilt continuous across a duration change (only when idle -
     // a running operation keeps its original budget and normalisation).
-    if (this->current_operation == COVER_OPERATION_IDLE) {
+    if (this->current_operation == esphome::cover::COVER_OPERATION_IDLE) {
       this->exact_position_ =
           (int) (this->close_net_duration_ * this->position);
       this->exact_tilt_ = (int) (this->tilt_duration * this->tilt);
