@@ -443,8 +443,9 @@ static void test_limit_sequence() {
   check(!seq.store(now), "store refused during entry");
   while (seq.relay_up() && now < entered + 9000)
     now = limit_step(c, seq, now, 10, 100.0f);
-  check(!seq.relay_up() && !seq.relay_down(), "released on the acknowledgement");
-  check(now - entered >= 5000 && now - entered < 5400, "released right after 5 s");
+  check(!seq.relay_up() && !seq.relay_down(), "released after the jog");
+  near((now - entered) / 1000.0f, 8.0f, 0.02f, "power doesn't cut the jog short");
+  check(std::strstr(seq.take_message(), "In setting mode") != nullptr, "reports the acknowledgement");
 
   // No store before a move, or the parked height becomes the limit.
   check(!seq.store(now), "store refused before any move");
@@ -470,7 +471,7 @@ static void test_limit_store() {
     c.model.position = 0.2f;
     c.model.tilt = 0.0f;
     now = limit_enter(c, seq, now, LimitKind::LOWER);
-    now = limit_step(c, seq, now, 5500, 100.0f);
+    now = limit_step(c, seq, now, 8100, 100.0f);
     seq.run(now);
     now = limit_step(c, seq, now, 3000, 100.0f);
     seq.stop(now, c);
@@ -487,8 +488,23 @@ static void test_limit_store() {
     near(press_ms / 1000.0f, 1.0f, 0.05f, "one store press");
     check(!seq.active(), "sequence over");
     check(!seq.store(now) && !seq.run(now), "no more presses after the store");
-    near(c.model.position, 0.0f, 0.001f, "model at the new bottom");
-    check(std::strstr(seq.take_message(), "Stored") != nullptr, "reports stored");
+    near(c.model.position, 0.5f, 0.001f, "store doesn't claim the blind reached the bottom");
+    check(std::strstr(seq.take_message(), "Store press done") != nullptr, "reports the press, not a stored limit");
+
+    // The next close is anchored wherever the motor stops, without a false fault.
+    now += 1000;
+    c.request_position(now, 0.0f);
+    now = run_motor(c, now, 1000);
+    check(c.take_run_end() == RunEnd::AT_LIMIT, "a stop after the sequence is the limit");
+    check(!c.home_error_valid(), "no home error from an unknown start");
+    near(c.model.position, 0.0f, 0.001f, "anchored at the bottom");
+
+    // That applies to one stop only.
+    now += 1000;
+    c.model.position = 0.5f;
+    c.request_position(now, 0.0f);
+    now = run_motor(c, now, 3000);
+    check(c.take_run_end() == RunEnd::MID_TRAVEL_CUT, "later mid-travel stops are faults again");
   }
 
   // Upper limit: drive up, store with a down press.
@@ -498,7 +514,7 @@ static void test_limit_store() {
     c.model.tilt = 0.0f;
     now += 1000;
     now = limit_enter(c, seq, now, LimitKind::UPPER);
-    now = limit_step(c, seq, now, 5500, 100.0f);
+    now = limit_step(c, seq, now, 8100, 100.0f);
     seq.nudge(now);
     now = limit_step(c, seq, now, 500);
     check(seq.relay_up() && !seq.relay_down(), "upper limit drives up only");
@@ -508,8 +524,7 @@ static void test_limit_store() {
     now = limit_step(c, seq, now, 500);
     check(seq.relay_down() && !seq.relay_up(), "upper limit stores with down");
     now = limit_step(c, seq, now, 1100);
-    near(c.model.position, 1.0f, 0.001f, "model at the new top");
-    check(std::strstr(seq.take_message(), "not confirmed") != nullptr, "no store movement seen is reported");
+    check(std::strstr(seq.take_message(), "no movement seen") != nullptr, "no store movement seen is reported");
   }
 
   // The cap: nothing holds both relays long enough to reach the factory reset.
@@ -525,7 +540,9 @@ static void test_limit_store() {
       if (seq.relay_up() && seq.relay_down())
         both_ms += 10;
     }
-    near(both_ms / 1000.0f, LIMIT_ENTRY_CAP_MS / 1000.0f, 0.05f, "both relays stop at the cap with no acknowledgement");
+    near(both_ms / 1000.0f, LIMIT_ENTRY_HOLD_MS / 1000.0f, 0.05f, "both relays stop at the cap with no acknowledgement");
+    check(LIMIT_ENTRY_HOLD_MS < 15000, "well short of the factory reset");
+    check(std::strstr(seq.take_message(), "No movement") != nullptr, "says no acknowledgement was seen");
     check(seq.active(), "still waiting for a decision");
     check(seq.run(now), "run still possible if the blind did jog");
     now = limit_step(c, seq, now, 600, 0.5f);

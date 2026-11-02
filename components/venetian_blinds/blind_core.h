@@ -31,8 +31,10 @@ static const uint32_t CAL_PAUSE_MS = 1000;
 static const uint32_t CAL_MAX_DIFF_PERCENT = 25;
 
 // Guide 5133945A section 4. Both relays for 5 s enters setting mode; 15 s is a factory reset.
+// The motor answers from 5 s with a short up and down jog. Releasing at the first sign of it cut
+// the jog short and the motor never took the limit, so the hold is a fixed time past the jog.
 static const uint32_t LIMIT_ENTRY_ACK_FROM_MS = 5000;
-static const uint32_t LIMIT_ENTRY_CAP_MS = 8000;
+static const uint32_t LIMIT_ENTRY_HOLD_MS = 8000;
 static const uint32_t LIMIT_PARK_PAUSE_MS = 10000;
 static const uint32_t LIMIT_DRIVE_CAP_MS = 60000;
 static const uint32_t LIMIT_NUDGE_MS = 500;
@@ -196,6 +198,9 @@ class MotionController {
     any_cut_is_limit_ = true;
     move_(now, dir, Kind::FULL, dir == Direction::UP ? 1.0f : 0.0f);
   }
+  // The model can't say where the blind is after the limit sequence moved it, so the next stop
+  // counts wherever it comes.
+  void mark_position_unknown() { position_unknown_ = true; }
   // The limit sequence drove the relays itself, so the reversal gap has to count from then.
   void note_external_release(uint32_t now) {
     has_run_ = true;
@@ -239,10 +244,11 @@ class MotionController {
     const bool up = active_dir_ == Direction::UP;
     const bool in_end_zone = up ? model.position >= 1.0f - END_ZONE : model.position <= END_ZONE;
     ended_on_cut_ = event == PowerEvent::CUT;
-    home_error_valid_ = ended_on_cut_ && kind_ == Kind::FULL && !any_cut_is_limit_ && in_end_zone;
+    home_error_valid_ = ended_on_cut_ && kind_ == Kind::FULL && !any_cut_is_limit_ && !position_unknown_ && in_end_zone;
     if (home_error_valid_)
       home_error_ms_ = (int32_t) detector.cut_ms() - (int32_t) CUT_LAG_MS - (int32_t) expected_run_ms_;
-    if (in_end_zone || any_cut_is_limit_) {
+    if (in_end_zone || any_cut_is_limit_ || position_unknown_) {
+      position_unknown_ = false;
       model.position = up ? 1.0f : 0.0f;
       model.tilt = model.position;
       end_run_(now, RunEnd::AT_LIMIT);
@@ -391,6 +397,7 @@ class MotionController {
   bool pending_{false};
   bool stopping_{false};
   bool any_cut_is_limit_{false};
+  bool position_unknown_{false};
   bool external_release_{false};
   bool ended_on_cut_{false};
   bool home_error_valid_{false};
@@ -578,8 +585,10 @@ class LimitSequence {
         }
         break;
       case State::ENTERING:
-        if (now - state_from_ >= LIMIT_ENTRY_CAP_MS)
-          end_entry_(now, "No movement seen on power. If the blind jogged press Limit Run, otherwise Limit Cancel");
+        if (now - state_from_ >= LIMIT_ENTRY_HOLD_MS)
+          end_entry_(now, ack_seen_ ? "In setting mode. Limit Run or Limit Nudge moves the blind"
+                                    : "No movement seen on power. If the blind jogged press Limit Run, otherwise "
+                                      "Limit Cancel");
         break;
       case State::DRIVE_WAIT:
         if (now - last_off_ >= REVERSAL_DEAD_TIME_MS)
@@ -614,7 +623,6 @@ class LimitSequence {
       return;
     if (state_ == State::ENTERING && now - state_from_ >= LIMIT_ENTRY_ACK_FROM_MS) {
       ack_seen_ = true;
-      end_entry_(now, "In setting mode. Limit Run or Limit Nudge moves the blind");
     } else if (pressing_()) {
       press_moved_ = true;
     }
@@ -656,6 +664,7 @@ class LimitSequence {
     } else {
       message_ = entry_attempted_ ? "Cancelled. The motor may still be in setting mode: check before normal use"
                                   : "Cancelled, motor limits unchanged";
+      ctrl.mark_position_unknown();
       ctrl.note_external_release(now);
     }
     state_ = State::IDLE;
@@ -702,12 +711,12 @@ class LimitSequence {
   void finish_store_(uint32_t now, MotionController &ctrl) {
     const bool confirmed = ack_seen_ && press_moved_;
     state_ = State::IDLE;
-    const float end = kind_ == LimitKind::UPPER ? 1.0f : 0.0f;
-    ctrl.model.position = end;
-    ctrl.model.tilt = end;
+    ctrl.mark_position_unknown();
     ctrl.note_external_release(now);
-    message_ = confirmed ? "Stored. Check with a full open and close, then Calibrate Travel"
-                         : "Store press sent but not confirmed on power. Check with a full open and close";
+    // Power during the press shows the blind moved, which an ordinary move would do too. Only the
+    // time of a full run can prove the limit changed.
+    message_ = confirmed ? "Store press done. Run a full open and close: the close time shows if the limit moved"
+                         : "Store press sent, no movement seen on power. Run a full open and close to check";
   }
 
   State state_{State::IDLE};
