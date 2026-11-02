@@ -55,6 +55,26 @@ static uint32_t relay_time(MotionController &c, uint32_t now) {
   return on_ms;
 }
 
+// Drives a run with a motor that stops itself after motor_ms. motor_ms 0 means it never starts.
+// Returns the time reached. The meter reads every 500 ms unless the meter is dead.
+static uint32_t run_motor(MotionController &c, uint32_t now, uint32_t motor_ms, bool meter = true) {
+  const uint32_t start = now;
+  uint32_t relay_from = now;
+  bool on = false;
+  while (!c.idle() && now < start + 300000) {
+    now += 10;
+    c.tick(now);
+    const bool relay = c.relay_up() || c.relay_down();
+    if (relay && !on)
+      relay_from = now;
+    on = relay;
+    if (meter && relay && (now - relay_from) % 500 == 0)
+      c.on_power(now, c.active_is_up() ? Direction::UP : Direction::DOWN,
+                 motor_ms > 0 && now - relay_from < motor_ms + CUT_LAG_MS ? 100.0f : 0.5f);
+  }
+  return now;
+}
+
 static void test_position_scale() {
   // Living: the upstream bug showed 61% after this and took 19.3 s to reach 25%.
   MotionController c;
@@ -85,11 +105,13 @@ static void test_close_longer_than_open() {
   c.timing = make_timing(40000, 50000);
   uint32_t now = 1000;
   c.request_position(now, 1.0f);
-  now = run_until_idle(c, now);
+  now = run_motor(c, now, 40000);
   now += 1000;
   c.request_position(now, 0.0f);
-  const uint32_t on = relay_time(c, now);
-  near(on / 1000.0f, 50.0f, 0.1f, "full close takes the whole close time");
+  const uint32_t end = run_motor(c, now, 50000);
+  near(c.last_run_ms() / 1000.0f, 52.0f, 0.6f, "full close runs the whole close time and on to the cut");
+  check(end > now, "ran");
+  check(c.take_run_end() == RunEnd::AT_LIMIT, "ended at the limit");
 }
 
 static void test_duration_change_mid_move() {
@@ -97,7 +119,7 @@ static void test_duration_change_mid_move() {
   MotionController c;
   c.timing = make_timing(60000, 60000);
   uint32_t now = 1000;
-  c.request_position(now, 1.0f);
+  c.request_position(now, 0.9f);
   now += 10000;
   c.tick(now);
   const float before = c.model.position;
@@ -108,7 +130,7 @@ static void test_duration_change_mid_move() {
   now = run_until_idle(c, now, 40000);
   check(c.idle(), "relay released after shortening open time");
   check(!c.relay_up(), "relay off");
-  near(c.model.position, 1.0f, 0.0001f, "arrived at the top");
+  near(c.model.position, 0.9f, 0.0001f, "arrived at the target");
 
   c.timing = make_timing(60000, 60000);
   c.model.position = 0.5f;
@@ -179,24 +201,24 @@ static void test_min_command_length() {
 static void test_requests_at_ends() {
   MotionController c;
   c.timing = make_timing(60000, 60000);
-  check(!c.request_position(1000, 0.0f), "close at bottom with closed slats is no move");
-  c.model.tilt = 0.4f;
-  check(c.request_position(2000, 0.0f), "close at bottom with open slats moves");
-  uint32_t now = run_until_idle(c, 2000);
-  near(c.model.tilt, 0.0f, 0.0001f, "slats closed");
+  check(c.request_position(1000, 0.0f), "close at the model's bottom still runs");
+  uint32_t now = run_motor(c, 1000, 0);
+  near(c.last_run_ms() / 1000.0f, 4.0f, 0.1f, "stops when the motor never starts");
+  check(c.take_run_end() == RunEnd::AT_LIMIT, "already at the lower limit");
 
   c.model.position = 1.0f;
   c.model.tilt = 0.35f;
   now += 1000;
   check(c.request_position(now, 1.0f), "open at top with slats part open moves");
-  now = run_until_idle(c, now);
-  near(c.model.tilt, 1.0f, 0.0001f, "slats fully open");
+  now = run_motor(c, now, 1000);
+  near(c.model.tilt, 1.0f, 0.0001f, "a cut at the top anchors the slats");
+  c.take_run_end();
 
   now += 1000;
-  check(c.request_position(now, 1.0f), "open when fully open probes the top");
-  const uint32_t on = relay_time(c, now);
-  near(on / 1000.0f, TOP_PROBE_MS / 1000.0f, 0.05f, "probe length");
-  near(c.model.position, 1.0f, 0.0001f, "probe leaves the position");
+  check(c.request_position(now, 1.0f), "open when fully open still runs");
+  now = run_motor(c, now, 0);
+  near(c.last_run_ms() / 1000.0f, 4.0f, 0.1f, "top check reports inside its own run");
+  near(c.model.position, 1.0f, 0.0001f, "top check leaves the position");
 }
 
 static void test_tilt_keeps_position() {
@@ -222,13 +244,320 @@ static void test_time_limit() {
   c.timing = make_timing(40000, 40000);
   uint32_t now = 1000;
   c.request_position(now, 1.0f);
-  now += 5000;
-  c.tick(now);
-  c.timing.open_ms = 170000;  // the model can no longer arrive within the limit set at the start
-  const uint32_t end = run_until_idle(c, now, 400000);
-  check(c.idle(), "time limit releases the relay");
-  near((end - 1000) / 1000.0f, 40.0f - 1.75f + 1.75f + 15.0f, 0.5f, "stops at expected time plus margin");
+  const uint32_t end = run_motor(c, now, 0, false);
+  check(c.idle(), "time limit releases the relay with a dead meter");
+  near((end - now) / 1000.0f, 40.0f + 0.2f + 15.0f, 0.5f, "stops at a whole run plus margin");
   check(c.take_run_end() == RunEnd::TIME_LIMIT, "reported as a time limit");
+}
+
+static void test_homing() {
+  MotionController c;
+  c.timing = make_timing(40000, 40000);
+  uint32_t now = 1000;
+
+  // The time model is 3 s short: the relay stays on until the motor stops, then snaps.
+  c.request_position(now, 1.0f);
+  now = run_motor(c, now, 43000);
+  check(c.take_run_end() == RunEnd::AT_LIMIT, "full open ends at the limit");
+  near(c.model.position, 1.0f, 0.0001f, "position anchored");
+  near(c.model.tilt, 1.0f, 0.0001f, "tilt anchored");
+  check(c.home_error_valid(), "home error reported");
+  near(c.home_error_ms() / 1000.0f, 3.0f, 0.6f, "home error is the time the model was short");
+
+  // A stop halfway up may be an obstacle, so it must not become the top.
+  now += 1000;
+  c.model.position = 0.0f;
+  c.model.tilt = 0.0f;
+  c.request_position(now, 1.0f);
+  now = run_motor(c, now, 15000);
+  check(c.take_run_end() == RunEnd::MID_TRAVEL_CUT, "mid-travel stop is a fault");
+  check(c.model.position < 0.5f, "mid-travel stop isn't anchored");
+  check(c.idle() && !c.relay_up(), "mid-travel stop releases the relay");
+
+  // No power from far away from an end: motor protection, not the limit.
+  now += 1000;
+  c.request_position(now, 1.0f);
+  now = run_motor(c, now, 0);
+  check(c.take_run_end() == RunEnd::NO_POWER, "no power mid-travel is a fault");
+  check(c.model.position < 0.85f, "no power mid-travel isn't anchored");
+
+  // A partial move that meets the stop near the end anchors there.
+  now += 1000;
+  c.model.position = 0.9f;
+  c.model.tilt = 1.0f;
+  c.request_position(now, 0.99f);
+  c.timing.open_ms = 170000;  // too slow to arrive first
+  now = run_motor(c, now, 3000);
+  check(c.take_run_end() == RunEnd::AT_LIMIT, "partial move anchors in the end zone");
+  near(c.model.position, 1.0f, 0.0001f, "at the top");
+  c.timing = make_timing(40000, 40000);
+
+  // A tilt is timed only, whatever the meter says.
+  now += 1000;
+  c.model.position = 0.5f;
+  c.timing.tilt_ms = 6000;
+  c.model.tilt = 0.0f;
+  c.request_tilt(now, 1.0f);
+  now = run_motor(c, now, 0);
+  check(c.take_run_end() == RunEnd::ARRIVED, "tilt ignores the detector");
+  near(c.model.position, 0.5f, 0.0001f, "tilt didn't anchor");
+}
+
+static void calibrate(MotionController &c, TravelCalibration &cal, uint32_t &now, uint32_t down_ms, uint32_t up_ms,
+                      uint32_t top_ms = 2000) {
+  cal.start(now, c);
+  int guard = 0;
+  while (cal.active() && guard++ < 20) {
+    // Each phase runs until the controller goes idle, then the sequence starts the next.
+    const bool timing_down = c.busy_down();
+    const uint32_t motor = guard == 1 ? top_ms : (timing_down ? down_ms : up_ms);
+    now = run_motor(c, now, motor);
+    const RunEnd end = c.take_run_end();
+    if (end != RunEnd::NONE)
+      cal.on_run_end(now, end, c);
+    for (int i = 0; i < 120 && cal.active() && c.idle(); i++) {
+      now += 10;
+      c.tick(now);
+      cal.tick(now, c);
+    }
+  }
+}
+
+static void test_calibration() {
+  MotionController c;
+  c.timing = make_timing(54000, 54000);
+  TravelCalibration cal;
+  uint32_t now = 1000;
+  c.model.position = 0.5f;
+  c.model.tilt = 0.4f;
+  calibrate(c, cal, now, 33400, 33000);
+  check(!cal.active(), "calibration finished");
+  check(cal.take_timing_changed(), "times changed");
+  near(c.timing.open_ms / 1000.0f, 33.0f, 0.6f, "open measured with far too long old times");
+  near(c.timing.close_ms / 1000.0f, 33.4f, 0.6f, "close measured");
+  near(c.model.position, 0.5f, 0.001f, "position returned");
+  near(c.model.tilt, 0.4f, 0.001f, "tilt returned");
+
+  // Old times far too short also work: the model reaches its end long before the cut.
+  c.timing = make_timing(20000, 20000);
+  c.model.position = 1.0f;
+  c.model.tilt = 1.0f;
+  now += 1000;
+  calibrate(c, cal, now, 33400, 33000, 0);
+  check(cal.take_timing_changed(), "times changed from too short");
+  near(c.timing.open_ms / 1000.0f, 33.0f, 0.6f, "open measured");
+
+  // Rejections leave the times alone.
+  c.timing = make_timing(40000, 40000);
+  c.model.position = 1.0f;
+  c.model.tilt = 1.0f;
+  now += 1000;
+  calibrate(c, cal, now, 30000, 45000, 0);
+  check(!cal.take_timing_changed(), "25% difference rejected");
+  check(c.timing.open_ms == 40000 && c.timing.close_ms == 40000, "times kept");
+  check(std::strstr(cal.take_message(), "rejected") != nullptr, "says rejected");
+
+  c.model.position = 1.0f;
+  c.model.tilt = 1.0f;
+  now += 1000;
+  calibrate(c, cal, now, 0, 33000, 0);
+  check(!cal.take_timing_changed(), "motor never ran on the timed run");
+  check(c.timing.open_ms == 40000, "times kept after no cut");
+
+  // A cover command aborts it and that command runs.
+  c.model.position = 0.5f;
+  now += 1000;
+  cal.start(now, c);
+  now += 1000;
+  c.tick(now);
+  cal.abort();
+  c.request_position(now, 0.2f);
+  check(!cal.active(), "aborted");
+  check(!c.relay_up(), "the new command takes over");
+}
+
+static uint32_t limit_step(MotionController &c, LimitSequence &seq, uint32_t now, uint32_t ms, float watts = -1.0f) {
+  const uint32_t end = now + ms;
+  while (now < end) {
+    now += 10;
+    c.tick(now);
+    const RunEnd run_end = c.take_run_end();
+    if (run_end != RunEnd::NONE)
+      seq.on_run_end(now, run_end, c);
+    seq.tick(now, c);
+    check(!(c.relay_up() && c.relay_down()), "controller never closes both");
+    if (seq.relay_up() || seq.relay_down())
+      check(c.idle(), "controller is idle while the sequence holds a relay");
+    if (watts >= 0.0f && now % 250 == 0)
+      seq.on_power(now, watts);
+  }
+  return now;
+}
+
+// Parks the blind and waits for the moment both relays close.
+static uint32_t limit_enter(MotionController &c, LimitSequence &seq, uint32_t now, LimitKind kind) {
+  seq.start(now, kind, c);
+  for (int i = 0; i < 20000 && !(seq.relay_up() && seq.relay_down()); i++) {
+    now = limit_step(c, seq, now, 10);
+  }
+  return now;
+}
+
+static void test_limit_sequence() {
+  MotionController c;
+  c.timing = make_timing(33000, 33400);
+  LimitSequence seq;
+  uint32_t now = 1000;
+
+  // Parking ends on an up move at mid height, from above and from below.
+  c.model.position = 0.8f;
+  c.model.tilt = 1.0f;
+  seq.start(now, LimitKind::LOWER, c);
+  check(c.relay_down(), "parking from above goes down first");
+  while (!c.relay_up() && now < 100000)
+    now = limit_step(c, seq, now, 10);
+  check(c.relay_up(), "then up");
+  bool last_up = true;
+  bool both = false;
+  uint32_t stopped_at = 0;
+  while (!both && now < 200000) {
+    if (c.relay_down())
+      last_up = false;
+    if (c.relay_up())
+      stopped_at = now;
+    now = limit_step(c, seq, now, 10);
+    both = seq.relay_up() && seq.relay_down();
+  }
+  check(both, "both relays close after parking");
+  check(last_up, "the last move before entry went up");
+  check(now - stopped_at >= LIMIT_PARK_PAUSE_MS, "long pause before entry");
+  near(c.model.position, 0.5f, 0.001f, "parked at mid height");
+
+  seq.on_power(now + 5100, NAN);
+  check(seq.relay_up() && seq.relay_down(), "a bad reading is not an acknowledgement");
+
+  // Power before 5 s is ignored: releasing early would miss setting mode.
+  const uint32_t entered = now;
+  now = limit_step(c, seq, now, 4500, 100.0f);
+  check(seq.relay_up() && seq.relay_down(), "both held through early power");
+  check(!seq.store(now), "store refused during entry");
+  while (seq.relay_up() && now < entered + 9000)
+    now = limit_step(c, seq, now, 10, 100.0f);
+  check(!seq.relay_up() && !seq.relay_down(), "released on the acknowledgement");
+  check(now - entered >= 5000 && now - entered < 5400, "released right after 5 s");
+
+  // No store before a move, or the parked height becomes the limit.
+  check(!seq.store(now), "store refused before any move");
+  check(seq.run(now), "run accepted");
+  check(!seq.relay_down(), "run waits the reversal gap after both relays");
+  now = limit_step(c, seq, now, 500, 100.0f);
+  check(seq.relay_down() && !seq.relay_up(), "lower limit drives down only");
+  now = limit_step(c, seq, now, 5000, 100.0f);
+  seq.stop(now, c);
+  check(!seq.relay_down(), "stop cuts the relay");
+  check(seq.store(now), "store accepted after a move");
+  check(!seq.relay_up(), "store press waits the reversal gap");
+}
+
+static void test_limit_store() {
+  MotionController c;
+  c.timing = make_timing(33000, 33400);
+  uint32_t now = 1000;
+
+  // Lower limit: drive down, store with a single up press.
+  {
+    LimitSequence seq;
+    c.model.position = 0.2f;
+    c.model.tilt = 0.0f;
+    now = limit_enter(c, seq, now, LimitKind::LOWER);
+    now = limit_step(c, seq, now, 5500, 100.0f);
+    seq.run(now);
+    now = limit_step(c, seq, now, 3000, 100.0f);
+    seq.stop(now, c);
+    now = limit_step(c, seq, now, 100);
+    check(seq.store(now), "store accepted");
+    check(!seq.relay_up(), "store press waits the reversal gap");
+    uint32_t press_ms = 0;
+    for (int i = 0; i < 400 && seq.active(); i++) {
+      now = limit_step(c, seq, now, 10, 100.0f);
+      if (seq.relay_up())
+        press_ms += 10;
+      check(!seq.relay_down(), "store never drives down on a lower limit");
+    }
+    near(press_ms / 1000.0f, 1.0f, 0.05f, "one store press");
+    check(!seq.active(), "sequence over");
+    check(!seq.store(now) && !seq.run(now), "no more presses after the store");
+    near(c.model.position, 0.0f, 0.001f, "model at the new bottom");
+    check(std::strstr(seq.take_message(), "Stored") != nullptr, "reports stored");
+  }
+
+  // Upper limit: drive up, store with a down press.
+  {
+    LimitSequence seq;
+    c.model.position = 0.2f;
+    c.model.tilt = 0.0f;
+    now += 1000;
+    now = limit_enter(c, seq, now, LimitKind::UPPER);
+    now = limit_step(c, seq, now, 5500, 100.0f);
+    seq.nudge(now);
+    now = limit_step(c, seq, now, 500);
+    check(seq.relay_up() && !seq.relay_down(), "upper limit drives up only");
+    now = limit_step(c, seq, now, 510);
+    check(!seq.relay_up(), "nudge ends itself");
+    seq.store(now);
+    now = limit_step(c, seq, now, 500);
+    check(seq.relay_down() && !seq.relay_up(), "upper limit stores with down");
+    now = limit_step(c, seq, now, 1100);
+    near(c.model.position, 1.0f, 0.001f, "model at the new top");
+    check(std::strstr(seq.take_message(), "not confirmed") != nullptr, "no store movement seen is reported");
+  }
+
+  // The cap: nothing holds both relays long enough to reach the factory reset.
+  {
+    LimitSequence seq;
+    c.model.position = 0.2f;
+    c.model.tilt = 0.0f;
+    now += 1000;
+    now = limit_enter(c, seq, now, LimitKind::LOWER);
+    uint32_t both_ms = 0;
+    for (int i = 0; i < 2000; i++) {
+      now = limit_step(c, seq, now, 10, 0.5f);
+      if (seq.relay_up() && seq.relay_down())
+        both_ms += 10;
+    }
+    near(both_ms / 1000.0f, LIMIT_ENTRY_CAP_MS / 1000.0f, 0.05f, "both relays stop at the cap with no acknowledgement");
+    check(seq.active(), "still waiting for a decision");
+    check(seq.run(now), "run still possible if the blind did jog");
+    now = limit_step(c, seq, now, 600, 0.5f);
+    check(seq.relay_down(), "driving");
+    now = limit_step(c, seq, now, LIMIT_NO_MOVE_MS, 0.5f);
+    check(!seq.relay_down(), "no movement stops the drive");
+    check(std::strstr(seq.take_message(), "factory locked") != nullptr, "says it may be factory locked");
+    seq.cancel(now, c);
+    check(!seq.active() && !seq.relay_up() && !seq.relay_down(), "cancel ends it with relays off");
+    check(std::strstr(seq.take_message(), "setting mode") != nullptr, "warns about setting mode");
+    c.request_position(now, 0.8f);
+    check(!c.relay_up(), "a normal move waits the reversal gap after the sequence");
+    now += REVERSAL_DEAD_TIME_MS;
+    c.tick(now);
+    check(c.relay_up(), "then runs");
+    c.request_stop(now + 300);
+    now += 800;
+    c.tick(now);
+  }
+
+  // Stop during parking ends it without touching the motor's settings.
+  {
+    LimitSequence seq;
+    c.model.position = 0.8f;
+    now += 1000;
+    seq.start(now, LimitKind::UPPER, c);
+    now = limit_step(c, seq, now, 1000);
+    seq.stop(now, c);
+    now = limit_step(c, seq, now, 100);
+    check(!seq.active() && c.idle(), "stop during parking ends it");
+    check(std::strstr(seq.take_message(), "unchanged") != nullptr, "limits unchanged");
+  }
 }
 
 static void test_validation() {
@@ -293,6 +622,10 @@ int main() {
   test_requests_at_ends();
   test_tilt_keeps_position();
   test_time_limit();
+  test_homing();
+  test_calibration();
+  test_limit_sequence();
+  test_limit_store();
   test_validation();
   test_t1_traces();
   printf("%d checks, %d failures\n", checks, failures);

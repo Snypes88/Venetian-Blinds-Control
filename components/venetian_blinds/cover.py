@@ -1,6 +1,6 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
-from esphome.components import cover, number, output, sensor
+from esphome.components import button, cover, number, output, sensor, switch, text_sensor
 from esphome.const import (
     CONF_ASSUMED_STATE,
     CONF_CLOSE_DURATION,
@@ -11,11 +11,10 @@ from esphome.const import (
     ENTITY_CATEGORY_CONFIG,
     ENTITY_CATEGORY_DIAGNOSTIC,
     STATE_CLASS_MEASUREMENT,
-    UNIT_PERCENT,
     UNIT_SECOND,
 )
 
-AUTO_LOAD = ["number", "sensor"]
+AUTO_LOAD = ["button", "number", "sensor", "switch", "text_sensor"]
 DEPENDENCIES = ["output"]
 
 CONF_TILT_DURATION = "tilt_duration"
@@ -30,12 +29,28 @@ CONF_CLOSE_NUMBER = "close_number"
 CONF_TILT_NUMBER = "tilt_number"
 CONF_LAST_RUN_TIME = "last_run_time"
 CONF_LAST_CUT_TIME = "last_cut_time"
-CONF_CUT_POSITION = "cut_position"
+CONF_HOME_ERROR = "home_error"
+CONF_POWER_METER = "power_meter"
+CONF_STATUS = "status"
+CONF_SERVICE_MODE = "service_mode"
 
 venetian_blinds_ns = cg.esphome_ns.namespace("venetian_blinds")
 VenetianBlinds = venetian_blinds_ns.class_("VenetianBlinds", cover.Cover, cg.Component)
 DurationNumber = venetian_blinds_ns.class_("DurationNumber", number.Number)
 DurationKind = venetian_blinds_ns.enum("DurationKind", is_class=True)
+ServiceButton = venetian_blinds_ns.class_("ServiceButton", button.Button)
+ServiceModeSwitch = venetian_blinds_ns.class_("ServiceModeSwitch", switch.Switch)
+ServiceAction = venetian_blinds_ns.enum("ServiceAction", is_class=True)
+
+SERVICE_BUTTONS = {
+    "calibrate_button": (ServiceAction.CALIBRATE, "mdi:timer-sync-outline"),
+    "set_upper_button": (ServiceAction.SET_UPPER, "mdi:arrow-collapse-up"),
+    "set_lower_button": (ServiceAction.SET_LOWER, "mdi:arrow-collapse-down"),
+    "limit_run_button": (ServiceAction.RUN, "mdi:play"),
+    "limit_nudge_button": (ServiceAction.NUDGE, "mdi:debug-step-over"),
+    "limit_store_button": (ServiceAction.STORE, "mdi:content-save"),
+    "limit_cancel_button": (ServiceAction.CANCEL, "mdi:cancel"),
+}
 
 _DURATION_NUMBER_SCHEMA = number.number_schema(
     DurationNumber,
@@ -80,18 +95,35 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_ASSUMED_STATE, default=True): cv.boolean,
             cv.Optional(CONF_POWER_UP): cv.use_id(sensor.Sensor),
             cv.Optional(CONF_POWER_DOWN): cv.use_id(sensor.Sensor),
+            cv.Optional(CONF_POWER_METER): cv.use_id(cg.PollingComponent),
             cv.Optional(CONF_CUT_THRESHOLD, default=30.0): cv.positive_float,
             cv.Optional(CONF_OPEN_NUMBER): _DURATION_NUMBER_SCHEMA,
             cv.Optional(CONF_CLOSE_NUMBER): _DURATION_NUMBER_SCHEMA,
             cv.Optional(CONF_TILT_NUMBER): _DURATION_NUMBER_SCHEMA,
             cv.Optional(CONF_LAST_RUN_TIME): _diagnostic_seconds(),
             cv.Optional(CONF_LAST_CUT_TIME): _diagnostic_seconds(),
-            cv.Optional(CONF_CUT_POSITION): sensor.sensor_schema(
-                unit_of_measurement=UNIT_PERCENT,
-                accuracy_decimals=1,
+            cv.Optional(CONF_HOME_ERROR): sensor.sensor_schema(
+                unit_of_measurement=UNIT_SECOND,
+                accuracy_decimals=2,
                 state_class=STATE_CLASS_MEASUREMENT,
                 entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
             ),
+            cv.Optional(CONF_STATUS): text_sensor.text_sensor_schema(
+                entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+                icon="mdi:information-outline",
+            ),
+            cv.Optional(CONF_SERVICE_MODE): switch.switch_schema(
+                ServiceModeSwitch,
+                entity_category=ENTITY_CATEGORY_CONFIG,
+                icon="mdi:wrench-clock",
+                default_restore_mode="ALWAYS_OFF",
+            ),
+            **{
+                cv.Optional(key): button.button_schema(
+                    ServiceButton, entity_category=ENTITY_CATEGORY_CONFIG, icon=icon
+                )
+                for key, (_, icon) in SERVICE_BUTTONS.items()
+            },
         }
     )
     .extend(cv.COMPONENT_SCHEMA),
@@ -120,6 +152,8 @@ async def to_code(config):
     cg.add(var.set_assumed_state(config[CONF_ASSUMED_STATE]))
     cg.add(var.set_cut_threshold(config[CONF_CUT_THRESHOLD]))
 
+    if CONF_POWER_METER in config:
+        cg.add(var.set_power_meter(await cg.get_variable(config[CONF_POWER_METER])))
     if CONF_POWER_UP in config:
         cg.add(var.set_power_up_sensor(await cg.get_variable(config[CONF_POWER_UP])))
     if CONF_POWER_DOWN in config:
@@ -133,5 +167,16 @@ async def to_code(config):
         cg.add(var.set_last_run_sensor(await sensor.new_sensor(conf)))
     if conf := config.get(CONF_LAST_CUT_TIME):
         cg.add(var.set_last_cut_sensor(await sensor.new_sensor(conf)))
-    if conf := config.get(CONF_CUT_POSITION):
-        cg.add(var.set_cut_position_sensor(await sensor.new_sensor(conf)))
+    if conf := config.get(CONF_HOME_ERROR):
+        cg.add(var.set_home_error_sensor(await sensor.new_sensor(conf)))
+    if conf := config.get(CONF_STATUS):
+        cg.add(var.set_status_sensor(await text_sensor.new_text_sensor(conf)))
+    if conf := config.get(CONF_SERVICE_MODE):
+        sw = await switch.new_switch(conf)
+        cg.add(sw.set_parent(var))
+        cg.add(var.set_service_mode_switch(sw))
+    for key, (action, _) in SERVICE_BUTTONS.items():
+        if conf := config.get(key):
+            btn = await button.new_button(conf)
+            cg.add(btn.set_parent(var))
+            cg.add(btn.set_action(action))
