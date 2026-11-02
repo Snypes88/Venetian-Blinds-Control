@@ -1,80 +1,82 @@
 #pragma once
 #include "esphome/components/cover/cover.h"
-#include "esphome/core/automation.h"
+#include "esphome/components/number/number.h"
+#include "esphome/components/output/binary_output.h"
+#include "esphome/components/sensor/sensor.h"
 #include "esphome/core/component.h"
+#include "esphome/core/preferences.h"
+#include "blind_core.h"
 
 namespace esphome {
 namespace venetian_blinds {
 
+class VenetianBlinds;
+
+enum class DurationKind : uint8_t { OPEN = 0, CLOSE = 1, TILT = 2 };
+
+class DurationNumber : public number::Number {
+ public:
+  void set_parent(VenetianBlinds *parent) { this->parent_ = parent; }
+  void set_kind(DurationKind kind) { this->kind_ = kind; }
+
+ protected:
+  void control(float value) override;
+
+  VenetianBlinds *parent_{nullptr};
+  DurationKind kind_{DurationKind::OPEN};
+};
+
 class VenetianBlinds : public Component, public cover::Cover {
-public:
+ public:
   void setup() override;
   void loop() override;
   void dump_config() override;
   cover::CoverTraits get_traits() override;
   void control(const cover::CoverCall &call) override;
-  Trigger<> *get_open_trigger() const { return this->open_trigger; }
-  Trigger<> *get_close_trigger() const { return this->close_trigger; }
-  Trigger<> *get_stop_trigger() const { return this->stop_trigger; }
-  void set_open_duration(uint32_t open) { this->open_duration = open; }
-  void set_close_duration(uint32_t close) { this->close_duration = close; }
-  void set_tilt_duration(uint32_t tilt) { this->tilt_duration = tilt; }
-  void set_actuator_activation_duration(uint32_t actuator_activation) { this->actuator_activation_duration = actuator_activation; }
-  void set_assumed_state(bool value) { this->assumed_state = value; }
-  // Runtime calibration (v6): apply open/close/tilt durations in ms and recompute
-  // the net-travel budgets + rescale the internal counters so the published
-  // position/tilt stay continuous. Safe to call any time; takes effect on the
-  // next cover operation (a running operation keeps its original time budget).
-  void set_all_durations(uint32_t open, uint32_t close, uint32_t tilt) {
-    this->open_duration = open;
-    this->close_duration = close;
-    this->tilt_duration = tilt;
-    this->recompute_net_durations_();
-  }
 
-protected:
-  Trigger<> *open_trigger{new Trigger<>()};
-  Trigger<> *close_trigger{new Trigger<>()};
-  Trigger<> *stop_trigger{new Trigger<>()};
-  uint32_t open_duration;
-  uint32_t close_duration;
-  uint32_t tilt_duration;
-  uint32_t actuator_activation_duration;
-  bool assumed_state{false};
+  void set_up_output(output::BinaryOutput *output) { this->up_output_ = output; }
+  void set_down_output(output::BinaryOutput *output) { this->down_output_ = output; }
+  void set_open_duration(uint32_t ms) { this->seed_.open_ms = ms; }
+  void set_close_duration(uint32_t ms) { this->seed_.close_ms = ms; }
+  void set_tilt_duration(uint32_t ms) { this->seed_.tilt_ms = ms; }
+  void set_actuator_activation_duration(uint32_t ms) { this->seed_.activation_ms = ms; }
+  void set_assumed_state(bool value) { this->assumed_state_ = value; }
+  void set_power_up_sensor(sensor::Sensor *sensor) { this->power_up_ = sensor; }
+  void set_power_down_sensor(sensor::Sensor *sensor) { this->power_down_ = sensor; }
+  void set_cut_threshold(float watts) { this->ctrl_.detector.threshold_w = watts; }
+  void set_open_number(DurationNumber *number) { this->numbers_[0] = number; }
+  void set_close_number(DurationNumber *number) { this->numbers_[1] = number; }
+  void set_tilt_number(DurationNumber *number) { this->numbers_[2] = number; }
+  void set_last_run_sensor(sensor::Sensor *sensor) { this->last_run_sensor_ = sensor; }
+  void set_last_cut_sensor(sensor::Sensor *sensor) { this->last_cut_sensor_ = sensor; }
+  void set_cut_position_sensor(sensor::Sensor *sensor) { this->cut_position_sensor_ = sensor; }
 
-private:
-  uint32_t start_dir_time_{0};
-  uint32_t last_recompute_time_{0};
-  uint32_t last_publish_time_{0};
-  uint32_t open_net_duration_;
-  uint32_t close_net_duration_;
-  uint32_t target_position_{0};
-  uint32_t target_tilt_{0};
-  int exact_position_{0};
-  int exact_tilt_{0};
+  // Applies a new duration if the resulting timing is valid, else keeps the old one.
+  void set_duration(DurationKind kind, uint32_t ms);
 
-  void recompute_net_durations_() {
-    const uint32_t tilt_and_activation_duration =
-        this->tilt_duration + this->actuator_activation_duration;
-    this->open_net_duration_ = this->open_duration - tilt_and_activation_duration;
-    this->close_net_duration_ = this->close_duration - tilt_and_activation_duration;
-    // Keep position/tilt continuous across a duration change (only when idle -
-    // a running operation keeps its original budget and normalisation).
-    if (this->current_operation == esphome::cover::COVER_OPERATION_IDLE) {
-      this->exact_position_ =
-          (int) (this->close_net_duration_ * this->position);
-      this->exact_tilt_ = (int) (this->tilt_duration * this->tilt);
-    }
-  }
+ protected:
+  void load_timing_();
+  void publish_number_(DurationKind kind);
+  void apply_outputs_();
+  void sync_state_();
+  void on_power_(Direction channel, float watts);
 
-  void stop_prev_trigger_();
-  bool is_at_target_() const;
-  void start_direction_(cover::CoverOperation dir);
-  void recompute_position_();
+  MotionController ctrl_;
+  Timing seed_;
+  bool assumed_state_{false};
+  bool was_idle_{true};
+  uint32_t last_publish_{0};
 
-  Trigger<> *prev_command_trigger_{nullptr};
-  cover::CoverOperation last_operation_{cover::COVER_OPERATION_OPENING};
+  output::BinaryOutput *up_output_{nullptr};
+  output::BinaryOutput *down_output_{nullptr};
+  sensor::Sensor *power_up_{nullptr};
+  sensor::Sensor *power_down_{nullptr};
+  sensor::Sensor *last_run_sensor_{nullptr};
+  sensor::Sensor *last_cut_sensor_{nullptr};
+  sensor::Sensor *cut_position_sensor_{nullptr};
+  DurationNumber *numbers_[3]{nullptr, nullptr, nullptr};
+  ESPPreferenceObject prefs_[3];
 };
 
-} // namespace venetian_blinds
-} // namespace esphome
+}  // namespace venetian_blinds
+}  // namespace esphome

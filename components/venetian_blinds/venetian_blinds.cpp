@@ -1,46 +1,94 @@
 #include "venetian_blinds.h"
 #include "esphome/core/hal.h"
+#include "esphome/core/helpers.h"
 #include "esphome/core/log.h"
 
 namespace esphome {
 namespace venetian_blinds {
 
-static const char *TAG = "venetian_blinds.cover";
+static const char *const TAG = "venetian_blinds.cover";
 
 using namespace esphome::cover;
 
+void DurationNumber::control(float value) {
+  this->parent_->set_duration(this->kind_, (uint32_t) lroundf(value * 1000.0f));
+}
+
 void VenetianBlinds::dump_config() {
   LOG_COVER("", "Venetian Blinds", this);
-  ESP_LOGCONFIG(TAG, "  Open Duration: %.1fs", this->open_duration / 1e3f);
-  ESP_LOGCONFIG(TAG, "  Close Duration: %.1fs", this->close_duration / 1e3f);
-  ESP_LOGCONFIG(TAG, "  Tilt Open/Close Duration: %.1fs",
-                this->tilt_duration / 1e3f);
-  ESP_LOGCONFIG(TAG, "  Actuator Activation Duration: %.1fs",
-                this->actuator_activation_duration / 1e3f);
-  ESP_LOGCONFIG(TAG, "  Open Net Duration: %.1fs",
-                this->open_net_duration_ / 1e3f);
-  ESP_LOGCONFIG(TAG, "  Close Net Duration: %.1fs",
-                this->close_net_duration_ / 1e3f);
+  const Timing &t = this->ctrl_.timing;
+  ESP_LOGCONFIG(TAG, "  Open Duration: %.2fs", t.open_ms / 1e3f);
+  ESP_LOGCONFIG(TAG, "  Close Duration: %.2fs", t.close_ms / 1e3f);
+  ESP_LOGCONFIG(TAG, "  Tilt Duration: %.2fs", t.tilt_ms / 1e3f);
+  ESP_LOGCONFIG(TAG, "  Actuator Activation Duration: %.2fs", t.activation_ms / 1e3f);
+  ESP_LOGCONFIG(TAG, "  Cut Threshold: %.0fW (log only, homing not enabled)", this->ctrl_.detector.threshold_w);
+}
+
+void VenetianBlinds::load_timing_() {
+  static const char *const KEYS[3] = {"venetian_blinds_open_ms", "venetian_blinds_close_ms",
+                                      "venetian_blinds_tilt_ms"};
+  Timing timing = this->seed_;
+  uint32_t *fields[3] = {&timing.open_ms, &timing.close_ms, &timing.tilt_ms};
+  for (int i = 0; i < 3; i++) {
+    this->prefs_[i] = global_preferences->make_preference<uint32_t>(fnv1_hash(KEYS[i]));
+    uint32_t saved;
+    if (this->prefs_[i].load(&saved))
+      *fields[i] = saved;
+  }
+  if (!timing.valid()) {
+    ESP_LOGW(TAG, "Saved durations are invalid, using the configured seeds");
+    timing = this->seed_;
+  }
+  this->ctrl_.timing = timing;
 }
 
 void VenetianBlinds::setup() {
+  this->load_timing_();
+
   auto restore = this->restore_state_();
   if (restore.has_value()) {
     restore->apply(this);
   } else {
-    this->position = 0.0;
-    this->tilt = 0.0;
+    this->position = 0.0f;
+    this->tilt = 0.0f;
   }
-  const uint32_t tilt_and_activation_duration = this->tilt_duration +
-      this->actuator_activation_duration;
-  this->open_net_duration_ = this->open_duration - tilt_and_activation_duration;
-  this->close_net_duration_ = this->close_duration - tilt_and_activation_duration;
+  this->ctrl_.model.position = clamp(this->position, 0.0f, 1.0f);
+  this->ctrl_.model.tilt = clamp(this->tilt, 0.0f, 1.0f);
 
-  this->exact_position_ =
-      this->close_net_duration_ *
-      this->position; // position factor should be same for both open and close
-                      // even if both durations are different
-  this->exact_tilt_ = this->tilt_duration * this->tilt;
+  if (this->power_up_ != nullptr) {
+    this->power_up_->add_on_raw_state_callback([this](float watts) { this->on_power_(Direction::UP, watts); });
+  }
+  if (this->power_down_ != nullptr) {
+    this->power_down_->add_on_raw_state_callback([this](float watts) { this->on_power_(Direction::DOWN, watts); });
+  }
+
+  this->publish_number_(DurationKind::OPEN);
+  this->publish_number_(DurationKind::CLOSE);
+  this->publish_number_(DurationKind::TILT);
+}
+
+void VenetianBlinds::publish_number_(DurationKind kind) {
+  DurationNumber *number = this->numbers_[(uint8_t) kind];
+  if (number == nullptr)
+    return;
+  const Timing &t = this->ctrl_.timing;
+  const uint32_t ms = kind == DurationKind::OPEN ? t.open_ms : (kind == DurationKind::CLOSE ? t.close_ms : t.tilt_ms);
+  number->publish_state(ms / 1000.0f);
+}
+
+void VenetianBlinds::set_duration(DurationKind kind, uint32_t ms) {
+  Timing candidate = this->ctrl_.timing;
+  uint32_t *field = kind == DurationKind::OPEN ? &candidate.open_ms
+                                               : (kind == DurationKind::CLOSE ? &candidate.close_ms : &candidate.tilt_ms);
+  *field = ms;
+  if (candidate.valid()) {
+    this->ctrl_.timing = candidate;
+    this->prefs_[(uint8_t) kind].save(&ms);
+  } else {
+    ESP_LOGW(TAG, "Rejected duration %.2fs: needs at least %.1fs of net travel", ms / 1e3f, MIN_NET_TRAVEL_MS / 1e3f);
+  }
+  // Republishing on rejection too puts the old value back in the UI.
+  this->publish_number_(kind);
 }
 
 CoverTraits VenetianBlinds::get_traits() {
@@ -48,174 +96,108 @@ CoverTraits VenetianBlinds::get_traits() {
   traits.set_supports_position(true);
   traits.set_supports_tilt(true);
   traits.set_supports_stop(true);
-  traits.set_is_assumed_state(this->assumed_state);
+  traits.set_is_assumed_state(this->assumed_state_);
   return traits;
 }
 
 void VenetianBlinds::control(const CoverCall &call) {
+  const uint32_t now = millis();
   if (call.get_stop()) {
-    this->start_direction_(COVER_OPERATION_IDLE);
-    this->publish_state();
+    this->ctrl_.request_stop(now);
   }
   if (call.get_position().has_value()) {
-    auto requested_position = *call.get_position();
-    if ((requested_position != this->position) ||
-        (requested_position == 0 && this->tilt > 0)) {
-      cover::CoverOperation operation;
-      uint32_t operation_duration;
-      if ((requested_position < this->position) ||
-          (requested_position == 0)) {
-        operation = COVER_OPERATION_CLOSING;
-        operation_duration = this->close_net_duration_;
-        this->target_tilt_ = 0.0f;
-      } else {
-        operation = COVER_OPERATION_OPENING;
-        operation_duration = this->open_net_duration_;
-        this->target_tilt_ = 1.0f;
-      }
-
-      this->target_position_ = requested_position * operation_duration;
-      this->start_direction_(operation);
+    if (!this->ctrl_.request_position(now, *call.get_position())) {
+      ESP_LOGD(TAG, "Position request needs no movement");
+    }
+  } else if (call.get_tilt().has_value()) {
+    if (!this->ctrl_.request_tilt(now, *call.get_tilt())) {
+      ESP_LOGD(TAG, "Tilt request needs no movement");
     }
   }
-  if (call.get_tilt().has_value()) {
-    auto requested_tilt = *call.get_tilt();
-    if (requested_tilt != this->tilt) {
-      auto operation = requested_tilt < this->tilt ? COVER_OPERATION_CLOSING
-                                                   : COVER_OPERATION_OPENING;
-      this->target_position_ = this->exact_position_;
-      this->target_tilt_ = requested_tilt * this->tilt_duration;
-      this->start_direction_(operation);
+  this->apply_outputs_();
+  this->sync_state_();
+  this->publish_state(false);
+  this->last_publish_ = now;
+  this->was_idle_ = false;
+}
+
+void VenetianBlinds::apply_outputs_() {
+  // Open before close, so the two relays are never on together.
+  if (!this->ctrl_.relay_up())
+    this->up_output_->turn_off();
+  if (!this->ctrl_.relay_down())
+    this->down_output_->turn_off();
+  if (this->ctrl_.relay_up())
+    this->up_output_->turn_on();
+  if (this->ctrl_.relay_down())
+    this->down_output_->turn_on();
+}
+
+void VenetianBlinds::sync_state_() {
+  this->position = this->ctrl_.model.position;
+  this->tilt = this->ctrl_.model.tilt;
+  if (this->ctrl_.busy_up()) {
+    this->current_operation = COVER_OPERATION_OPENING;
+  } else if (this->ctrl_.busy_down()) {
+    this->current_operation = COVER_OPERATION_CLOSING;
+  } else {
+    this->current_operation = COVER_OPERATION_IDLE;
+  }
+}
+
+void VenetianBlinds::on_power_(Direction channel, float watts) {
+  const uint32_t now = millis();
+  const PowerEvent event = this->ctrl_.on_power(now, channel, watts);
+  if (this->ctrl_.relay_up() || this->ctrl_.relay_down()) {
+    if (channel == (this->ctrl_.relay_up() ? Direction::UP : Direction::DOWN)) {
+      ESP_LOGD(TAG, "trace t=%u p=%.1f pos=%.3f tilt=%.3f", (unsigned) this->ctrl_.run_elapsed(now), watts,
+               this->ctrl_.model.position, this->ctrl_.model.tilt);
     }
+  }
+  const char *dir = channel == Direction::UP ? "up" : "down";
+  if (event == PowerEvent::CUT) {
+    const float cut_s = this->ctrl_.detector.cut_ms() / 1000.0f;
+    ESP_LOGI(TAG, "Cut going %s at %.2fs, model position %.3f", dir, cut_s, this->ctrl_.event_position());
+    if (this->last_cut_sensor_ != nullptr)
+      this->last_cut_sensor_->publish_state(cut_s);
+    if (this->cut_position_sensor_ != nullptr)
+      this->cut_position_sensor_->publish_state(this->ctrl_.event_position() * 100.0f);
+  } else if (event == PowerEvent::NEVER_RAN) {
+    ESP_LOGI(TAG, "Motor never ran going %s: already at its limit", dir);
+    if (this->last_cut_sensor_ != nullptr)
+      this->last_cut_sensor_->publish_state(0.0f);
   }
 }
 
 void VenetianBlinds::loop() {
-  if (this->current_operation == COVER_OPERATION_IDLE)
+  if (this->was_idle_ && this->ctrl_.idle())
     return;
 
   const uint32_t now = millis();
+  this->ctrl_.tick(now);
+  this->apply_outputs_();
+  this->sync_state_();
 
-  // Recompute position every loop cycle
-  this->recompute_position_();
+  const RunEnd end = this->ctrl_.take_run_end();
+  if (end != RunEnd::NONE) {
+    const float run_s = this->ctrl_.last_run_ms() / 1000.0f;
+    if (end == RunEnd::TIME_LIMIT) {
+      ESP_LOGW(TAG, "Run hit its time limit after %.1fs", run_s);
+    } else {
+      ESP_LOGD(TAG, "Run ended after %.2fs", run_s);
+    }
+    if (this->last_run_sensor_ != nullptr)
+      this->last_run_sensor_->publish_state(run_s);
+  }
 
-  if (this->is_at_target_()) {
-    this->start_direction_(COVER_OPERATION_IDLE);
+  if (this->ctrl_.idle()) {
     this->publish_state();
-  }
-
-  // Send current position every second
-  if (now - this->last_publish_time_ > 1000) {
+    this->was_idle_ = true;
+  } else if (now - this->last_publish_ > 1000) {
     this->publish_state(false);
-    this->last_publish_time_ = now;
+    this->last_publish_ = now;
   }
 }
 
-void VenetianBlinds::stop_prev_trigger_() {
-  if (this->prev_command_trigger_ != nullptr) {
-    this->prev_command_trigger_->stop_action();
-    this->prev_command_trigger_ = nullptr;
-  }
-}
-
-bool VenetianBlinds::is_at_target_() const {
-  switch (this->current_operation) {
-  case COVER_OPERATION_OPENING:
-    return this->exact_position_ >= this->target_position_ &&
-           this->exact_tilt_ >= this->target_tilt_;
-  case COVER_OPERATION_CLOSING:
-    return this->exact_position_ <= this->target_position_ &&
-           this->exact_tilt_ <= this->target_tilt_;
-  case COVER_OPERATION_IDLE:
-  default:
-    return true;
-  }
-}
-
-void VenetianBlinds::start_direction_(CoverOperation dir) {
-  if (dir == this->current_operation && dir != COVER_OPERATION_IDLE)
-    return;
-
-  this->recompute_position_();
-  Trigger<> *trig;
-  switch (dir) {
-  case COVER_OPERATION_IDLE:
-    trig = this->stop_trigger;
-    break;
-  case COVER_OPERATION_OPENING:
-    this->last_operation_ = dir;
-    trig = this->open_trigger;
-    break;
-  case COVER_OPERATION_CLOSING:
-    this->last_operation_ = dir;
-    trig = this->close_trigger;
-    break;
-  default:
-    return;
-  }
-
-  this->current_operation = dir;
-
-  const uint32_t now = millis();
-  this->start_dir_time_ = now;
-  this->last_recompute_time_ = now;
-
-  this->stop_prev_trigger_();
-  trig->trigger();
-  this->prev_command_trigger_ = trig;
-}
-
-void VenetianBlinds::recompute_position_() {
-  if (this->current_operation == COVER_OPERATION_IDLE)
-    return;
-
-  const uint32_t now = millis();
-
-  // when actuator is still activating, the position is not changed
-  const uint32_t actuator_start_time = this->start_dir_time_ + this->actuator_activation_duration;
-  const bool actuator_is_activating = now <= actuator_start_time;
-  if (actuator_is_activating)
-    return;
-
-  int direction;
-  int action_duration;
-  int tilt_boundary;
-  switch (this->current_operation) {
-  case COVER_OPERATION_OPENING:
-    direction = 1;
-    action_duration = this->open_net_duration_;
-    tilt_boundary = this->tilt_duration;
-    break;
-  case COVER_OPERATION_CLOSING:
-    direction = -1;
-    action_duration = this->close_net_duration_;
-    tilt_boundary = 0;
-    break;
-  default:
-    return;
-  }
-
-  /*
-   * when actuator-activation finished between "start_direction_" and this
-   * invocation of "recompute_position_", movement just started and the cover
-   * moved for (now - actuator_start_time)
-   */
-  const uint32_t movement_start_time = this->last_recompute_time_ < actuator_start_time ?
-      actuator_start_time : this->last_recompute_time_;
-  const uint32_t cover_moving_time = now - movement_start_time;
-  this->exact_tilt_ += direction * cover_moving_time;
-  const int tilt_overflow = direction * (this->exact_tilt_ - tilt_boundary);
-  this->exact_tilt_ = clamp(this->exact_tilt_, 0, (int)this->tilt_duration);
-  if (tilt_overflow > 0) {
-    this->exact_position_ += direction * tilt_overflow;
-    this->exact_position_ = clamp(this->exact_position_, 0, action_duration);
-  }
-
-  this->position = this->exact_position_ / (float)action_duration;
-  this->tilt = this->exact_tilt_ / (float)this->tilt_duration;
-
-  this->last_recompute_time_ = now;
-}
-
-} // namespace venetian_blinds
-} // namespace esphome
+}  // namespace venetian_blinds
+}  // namespace esphome
