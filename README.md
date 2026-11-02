@@ -1,52 +1,139 @@
 # Venetian-Blinds-Control
 
-This is for ESP microcontrollers to control time based venetian blinds - controlling the action (open/close/stop), position (0-100) and the tilt (0-100).
+An ESPHome cover for venetian blinds, controlling the action (open/close/stop), the position (0-100) and the tilt (0-100).
 
-For the position, 0 is closed, 100 is open - consistent with standard blinds and other 'things' that open and close (like valves) in Home Assistant and in general.
-Intuitively I'd do it the other way around (so that it would represent how much of the cover is out). I had number of discussions with HA developers, even tried to reverse it in the custom cover controller. But at the end, I agreed that despite all concerns this does make most sense, and trying to hack it causes more problems than benefits.
-If you do not like this from UI perspective, use a custom card and show it differently on front-end. But leave it standard at the back.
+This fork of [bruxy70/Venetian-Blinds-Control](https://github.com/bruxy70/Venetian-Blinds-Control) adds what a time-based cover can't do by itself:
 
-There are two versions of the controller: current - an ESPHome custom controller. And the legacy - based on Arduino code, using MQTT.
+- **Homing from motor power.** A full open or close runs until the motor cuts itself off at its limit, then re-anchors the position there, so errors don't build up.
+- **Runtime times.** Open, close and tilt times are number entities saved on the device, and `Calibrate Travel` measures open and close for you.
+- **End stops from a dashboard.** The motor's upper and lower limits can be set from Home Assistant, with no installer tool.
+- **Direct relay control.** The cover drives the two relays itself, so it can enforce the interlock and the reversal gap.
 
-## Current - ESPHome controller
+For the position, 0 is closed and 100 is open, as with other covers in Home Assistant.
 
-This uses a custom cover controller. Similar to the time based cover, but with added tilt control. To load the custom controller, add the following code to your ESPHome device configuration:
+**Hardware.** Tested on Sonoff Dual R3 boards with a BL0939 power meter and Somfy J4 WT motors, on ESPHome 2026.10. The limit procedure follows Somfy guide 5133945A and is specific to those motors. Other motors need their own check before you use it.
+
+## Installation
 
 ```yaml
 external_components:
   - source:
       type: git
-      url: https://github.com/bruxy70/Venetian-Blinds-Control
-      ref: master
+      url: https://github.com/Snypes88/Venetian-Blinds-Control
+      ref: v2.0.0
     components: [venetian_blinds]
 ```
 
-Then you can configure the blinds. For the parameters and use refer to the [Time Based Cover](https://esphome.io/components/cover/time_based.html), with two additional parameters:
-- **tilt_duration** (Required, Time): The amount of time it takes, to tilt between 0% and 100%
-- **actuator_activation_duration** (Optional, Time): The amount of time it takes for the actuator/motor to start moving. Defaults to `0`.
-Example: The Somfy J4 WT DataSheet states `Continuous orders of at least 200 ms must be sent to the drive to ensure proper execution.` The amount of time it takes is nondeterministic. Set `actuator_activation_duration: 200ms` for the blinds to move definitely.
+## Configuration
 
-Configuration example:
+`up_output` and `down_output` replace the `open_action`, `close_action` and `stop_action` of v1, so **v1 configs need changing**. Saved times from v1 are not carried over, and the configured times are used until new ones are saved.
 
 ```yaml
+uart:
+  tx_pin: GPIO25
+  rx_pin: GPIO26
+  baud_rate: 4800
+  parity: NONE
+  stop_bits: 2
+
+sensor:
+  - platform: bl0939
+    id: power_meter
+    update_interval: 120s  # idle rate; the cover polls faster by itself while moving
+    active_power_1:
+      name: "Active Power Up"
+      id: power_up
+    active_power_2:
+      name: "Active Power Down"
+      id: power_down
+
+# No HA entity on the relays: only the cover can close them.
+output:
+  - platform: gpio
+    pin: 27
+    id: relay_up
+  - platform: gpio
+    pin: 14
+    id: relay_down
+
 cover:
   - platform: venetian_blinds
-    name: "${cover1_name}"
-    id: cover1
-    open_action:
-      - switch.turn_on: relay1
-    open_duration: 51770ms
-    close_action:
-      - switch.turn_on: relay2
-    close_duration: 51200ms
-    tilt_duration: 1650ms
-    stop_action:
-      - switch.turn_off: relay1
-      - switch.turn_off: relay2
+    name: "Venetian"
+    up_output: relay_up
+    down_output: relay_down
+    open_duration: 40000ms
+    close_duration: 38000ms
+    tilt_duration: 1400ms
+    power_up: power_up
+    power_down: power_down
+    power_meter: power_meter
+    open_number:
+      name: "Open Duration"
+    close_number:
+      name: "Close Duration"
+    tilt_number:
+      name: "Tilt Duration"
+    last_run_time:
+      name: "Last Run Time"
+    last_cut_time:
+      name: "Last Cut Time"
+    home_error:
+      name: "Home Error"
+    status:
+      name: "Status"
+    calibrate_button:
+      name: "Calibrate Travel"
+    service_mode:
+      name: "Service Mode"
+    set_upper_button:
+      name: "Set Upper Limit"
+    set_lower_button:
+      name: "Set Lower Limit"
+    limit_run_button:
+      name: "Limit Run"
+    limit_nudge_button:
+      name: "Limit Nudge"
+    limit_store_button:
+      name: "Limit Store"
+    limit_cancel_button:
+      name: "Limit Cancel"
 ```
 
-To control the blinds by the wall switch, configure a binary switch with action to open and close them.
+| Option | Default | Purpose |
+|---|---|---|
+| `open_duration`, `close_duration`, `tilt_duration` | required | Starting times, used only when the device has none saved. |
+| `actuator_activation_duration` | `200ms` | Time for the motor to start. Somfy asks for commands of at least 200 ms. |
+| `cut_threshold` | `30` | Watts below which the motor counts as having cut off. |
+| `power_up`, `power_down`, `power_meter` | optional | The active power sensors and the meter. Homing, calibration and limit setting were only tested with these fitted. |
+
+All entities are optional, so leave out any you don't want.
+
+## Use
+
+**Calibrating.** Press `Calibrate Travel`. The blind runs to both limits, then saves the measured open and close times. Set `Tilt Duration` by eye: the rail still moving at the end of a tilt means it's too long, and slats that don't fully turn mean it's too short.
+
+**Faults.** `Status` reports problems. If the motor stops away from a limit, the position is marked untrusted, and the next full open or close puts it right. `Home Error` shows how far the model was from the real limit on the last full run.
+
+**Setting a motor limit**
+
+1. Turn on `Service Mode`. The limit buttons do nothing without it.
+2. Press `Set Upper Limit` or `Set Lower Limit`. The blind parks away from the limit, then holds both relays for 8 s. Wait for `Status` to say `In setting mode`.
+3. Press `Limit Run`, then Stop on the cover when it's near the target. Use `Limit Nudge` for the last part.
+4. Press `Limit Store` once. Service Mode turns itself off.
+5. Press `Calibrate Travel`. Only the full-run times show that a limit really moved. Power during a store press proves nothing.
+
+Keep at least 15 cm between the two limits, as the Somfy guide asks.
+
+**Limit Cancel can leave the motor in setting mode.** The firmware can't tell, and normal moves could then store a wrong limit. If you cancel, run the procedure again and finish it with `Limit Store`.
+
+**Both relays together are a motor command.** Holding them for 5 s enters setting mode and 15 s is a factory reset, so don't wire anything else to them. The firmware stops at 8 s and doesn't offer a factory reset.
+
+## Wall switches
+
+Wall switches work through the normal cover actions:
+
 ```yaml
+binary_sensor:
   - id: key1
     platform: gpio
     pin:
@@ -59,77 +146,19 @@ To control the blinds by the wall switch, configure a binary switch with action 
     on_release:
       then:
         - cover.stop: cover1
-  - id: key2
-    platform: gpio
-    pin:
-      number: ${key2_gpio}
-      mode: INPUT_PULLUP
-      inverted: True
-    on_press:
-      then:
-        - cover.close: cover1
-    on_release:
-      then:
-        - cover.stop: cover1
 ```
 
-I use a more advanced version, that will atomatically stop the cover when I hold it for a short time (less than 1s). If I hold it longer, it will keep running until the cover is fully open or closed (or unil I shortly press one of teh buttons). So for tilting it works as above. But to open or close it fully, you can release the button after 1s and it will continue moving.
+Use the same pattern with `cover.close` for the down key, and give the cover `id: cover1`. This example comes from the v1 README and hasn't been tested with v2.
 
-```yaml
-  - id: key1
-    platform: gpio
-    pin:
-      number: ${key1_gpio}
-      mode: INPUT_PULLUP
-      inverted: True
-    on_press:
-      then:
-        - cover.open: cover1
-        - wait_until:
-            condition: 
-                binary_sensor.is_off: key1
-            timeout: 1s
-        - if:
-            condition:
-                binary_sensor.is_off: key1
-            then:
-                - cover.stop: cover1
-  - id: key2
-    platform: gpio
-    pin:
-      number: ${key2_gpio}
-      mode: INPUT_PULLUP
-      inverted: True
-    on_press:
-      then:
-        - cover.close: cover1
-        - wait_until:
-            condition: 
-                binary_sensor.is_off: key2
-            timeout: 1s
-        - if:
-            condition:
-                binary_sensor.is_off: key2
-            then:
-                - cover.stop: cover1
+## Development
+
+The motion logic is in `components/venetian_blinds/blind_core.h`, with no ESPHome dependencies, so it can be tested on a PC:
+
+```bash
+cd tests
+c++ -std=c++17 -O1 -w host_test.cpp -o host_test
+./host_test
 ```
-
-For the regular roller shades I use the opposite logic - short press will fully open or close the cover. Holding the button longer will stop the cover after releasing it. This is done by adding a separate action for a long press. This would not make sense for venetian blades - as it would not allow controlling the tilt.
-
-```yaml
-    on_multi_click:
-    - timing:
-        - ON for at least 500ms
-      then:
-        - cover.open: cover1
-        - wait_until:
-            condition:
-              binary_sensor.is_off: key1
-        - cover.stop: cover1
-```
-
-There are also videos on my YouTube channel, explaining the standard Time Based Cover, and this one as well.
-(https://youtu.be/tg3nOoBFJLU and https://youtu.be/dk5yDBRHhbQ)
 
 ## Legacy - Arduino code (not maintained)
 
@@ -173,3 +202,6 @@ I have been using this for a long time and it works reliably.
 ## Author
 
 - **Václav Chaloupka** - _Initial work_ - [bruxy70](https://github.com/bruxy70)
+- **Snypes88** - _v2: power homing, runtime times and limit setting_
+
+MIT licence, see `LICENSE`. The v1 videos on the original author's YouTube channel explain the time-based cover this grew from: https://youtu.be/tg3nOoBFJLU and https://youtu.be/dk5yDBRHhbQ
