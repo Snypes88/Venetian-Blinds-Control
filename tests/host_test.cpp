@@ -490,6 +490,8 @@ static void test_limit_store() {
     check(!seq.store(now) && !seq.run(now), "no more presses after the store");
     near(c.model.position, 0.5f, 0.001f, "store doesn't claim the blind reached the bottom");
     check(std::strstr(seq.take_message(), "Store press done") != nullptr, "reports the press, not a stored limit");
+    check(seq.take_store_finished(), "a finished store is reported, so Service Mode can end");
+    check(!seq.take_store_finished(), "reported once");
 
     // The next close is anchored wherever the motor stops, without a false fault.
     now += 1000;
@@ -561,6 +563,33 @@ static void test_limit_store() {
     c.request_stop(now + 300);
     now += 800;
     c.tick(now);
+  }
+
+  // A second limit straight after a store parks down into the new limit, then carries on up.
+  {
+    LimitSequence seq;
+    c.model.position = 0.5f;
+    c.model.tilt = 1.0f;
+    c.mark_position_unknown();
+    now += 1000;
+    seq.start(now, LimitKind::UPPER, c);
+    now += 10;
+    c.tick(now);
+    for (int i = 0; i < 300 && c.relay_down(); i++) {
+      now += 10;
+      c.tick(now);
+      if (i % 50 == 49)
+        c.on_power(now, Direction::DOWN, i < 100 ? 100.0f : 0.5f);
+    }
+    check(!c.relay_down(), "the new limit stops the parking move");
+    now = limit_step(c, seq, now, 700);
+    check(seq.active() && c.relay_up(), "parking continues upward");
+    now = limit_step(c, seq, now, 40000);
+    near(c.model.position, 0.5f, 0.001f, "parked at mid height");
+    check(seq.active(), "on its way to setting mode");
+    seq.cancel(now, c);
+    now = limit_step(c, seq, now, 100);
+    seq.take_message();
   }
 
   // Stop during parking ends it without touching the motor's settings.

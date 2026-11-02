@@ -562,7 +562,10 @@ class LimitSequence {
   void on_run_end(uint32_t now, RunEnd end, MotionController &ctrl) {
     if (state_ != State::PARK_LOW && state_ != State::PARK_HIGH)
       return;
-    if (end != RunEnd::ARRIVED) {
+    // Straight after a store the model is above the blind, so going down can meet the new limit.
+    // That is a true position to park up from.
+    const bool met_lower_limit = state_ == State::PARK_LOW && end == RunEnd::AT_LIMIT;
+    if (end != RunEnd::ARRIVED && !met_lower_limit) {
       state_ = State::IDLE;
       message_ = "Parking failed, motor limits unchanged";
     } else if (state_ == State::PARK_LOW) {
@@ -674,6 +677,12 @@ class LimitSequence {
     message_ = nullptr;
     return message;
   }
+  // Reports once that a store press has finished.
+  bool take_store_finished() {
+    const bool finished = store_finished_;
+    store_finished_ = false;
+    return finished;
+  }
 
  private:
   enum class State { IDLE, PARK_LOW, PARK_HIGH, PARK_PAUSE, ENTERING, READY, DRIVE_WAIT, DRIVING, STORE_WAIT, STORING };
@@ -711,6 +720,7 @@ class LimitSequence {
   void finish_store_(uint32_t now, MotionController &ctrl) {
     const bool confirmed = ack_seen_ && press_moved_;
     state_ = State::IDLE;
+    store_finished_ = true;
     ctrl.mark_position_unknown();
     ctrl.note_external_release(now);
     // Power during the press shows the blind moved, which an ordinary move would do too. Only the
@@ -727,6 +737,7 @@ class LimitSequence {
   bool ack_seen_{false};
   bool driven_{false};
   bool press_moved_{false};
+  bool store_finished_{false};
   uint32_t state_from_{0};
   uint32_t last_off_{0};
   uint32_t press_limit_ms_{0};

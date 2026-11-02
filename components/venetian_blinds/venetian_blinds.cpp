@@ -373,6 +373,13 @@ void VenetianBlinds::loop() {
     this->on_run_end_(now, end);
   this->calibration_.tick(now, this->ctrl_);
   this->limit_.tick(now, this->ctrl_);
+  if (this->limit_.take_store_finished() && this->service_mode_) {
+    if (this->service_switch_ != nullptr) {
+      this->service_switch_->turn_off();
+    } else {
+      this->set_service_mode(false);
+    }
+  }
   this->refresh_();
 
   if (this->ctrl_.idle()) {
