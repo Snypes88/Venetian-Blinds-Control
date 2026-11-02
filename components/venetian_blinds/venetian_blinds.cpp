@@ -12,6 +12,8 @@ static const char *const TAG = "venetian_blinds.cover";
 static const uint32_t SERVICE_MODE_MS = 300000;
 static const uint32_t METER_MOVING_MS = 500;
 static const uint32_t METER_ENTRY_MS = 250;
+// Longer than the sensors' throttle, so HA gets a reading from after the motor has stopped.
+static const uint32_t METER_LINGER_MS = 6000;
 
 using namespace esphome::cover;
 
@@ -116,11 +118,16 @@ void VenetianBlinds::save_measured_timing_() {
 void VenetianBlinds::update_meter_interval_() {
   if (this->meter_ == nullptr)
     return;
+  const uint32_t now = millis();
   uint32_t wanted = this->meter_idle_ms_;
   if (this->limit_.fast_polling()) {
     wanted = METER_ENTRY_MS;
+    this->meter_fast_until_ = now + METER_LINGER_MS;
   } else if (!this->ctrl_.idle() || this->limit_.relay_up() || this->limit_.relay_down() ||
              this->calibration_.active()) {
+    wanted = METER_MOVING_MS;
+    this->meter_fast_until_ = now + METER_LINGER_MS;
+  } else if ((int32_t) (this->meter_fast_until_ - now) > 0) {
     wanted = METER_MOVING_MS;
   }
   if (wanted == this->meter_interval_ms_)
@@ -151,6 +158,7 @@ void VenetianBlinds::service_action(ServiceAction action) {
   const uint32_t now = millis();
   const bool free = this->ctrl_.idle() && !this->limit_.active() && !this->calibration_.active();
   bool accepted = true;
+  const char *refused = "Blind is busy. Wait for it to finish, or press Limit Cancel";
   switch (action) {
     case ServiceAction::CALIBRATE:
       accepted = free;
@@ -168,13 +176,22 @@ void VenetianBlinds::service_action(ServiceAction action) {
         this->limit_.start(now, action == ServiceAction::SET_UPPER ? LimitKind::UPPER : LimitKind::LOWER, this->ctrl_);
       break;
     case ServiceAction::RUN:
-      accepted = this->limit_.run(now);
-      break;
     case ServiceAction::NUDGE:
-      accepted = this->limit_.nudge(now);
-      break;
     case ServiceAction::STORE:
-      accepted = this->limit_.store(now);
+      if (action == ServiceAction::RUN) {
+        accepted = this->limit_.run(now);
+      } else if (action == ServiceAction::NUDGE) {
+        accepted = this->limit_.nudge(now);
+      } else {
+        accepted = this->limit_.store(now);
+      }
+      if (!this->limit_.active()) {
+        refused = "No limit is being set. Press Set Upper Limit or Set Lower Limit first";
+      } else if (action == ServiceAction::STORE && this->limit_.ready() && !this->limit_.can_store()) {
+        refused = "Move the blind with Limit Run or Limit Nudge before storing";
+      } else {
+        refused = "Wait: not ready yet. These buttons work once Status says In setting mode";
+      }
       break;
     case ServiceAction::CANCEL:
       if (this->limit_.active()) {
@@ -186,7 +203,7 @@ void VenetianBlinds::service_action(ServiceAction action) {
       break;
   }
   if (!accepted)
-    this->set_status_("That button is not available right now");
+    this->set_status_(refused);
   this->service_from_ = now;
   this->refresh_();
   this->was_idle_ = false;
@@ -354,7 +371,7 @@ void VenetianBlinds::on_run_end_(uint32_t now, RunEnd end) {
 
 void VenetianBlinds::loop() {
   if (this->was_idle_ && this->ctrl_.idle() && !this->calibration_.active() && !this->limit_.active() &&
-      !this->service_mode_)
+      !this->service_mode_ && this->meter_interval_ms_ == this->meter_idle_ms_)
     return;
 
   const uint32_t now = millis();

@@ -364,6 +364,18 @@ static void test_calibration() {
   check(!cal.take_timing_changed(), "motor never ran on the timed run");
   check(c.timing.open_ms == 40000, "times kept after no cut");
 
+  // With no true position to go back to, it stays at the top.
+  c.timing = make_timing(40000, 40000);
+  c.model.position = 0.5f;
+  c.model.tilt = 0.0f;
+  c.mark_position_unknown();
+  now += 1000;
+  calibrate(c, cal, now, 33400, 33000, 3000);
+  check(cal.take_timing_changed(), "times changed from an unknown start");
+  near(c.model.position, 1.0f, 0.001f, "left fully open");
+  near(c.model.tilt, 1.0f, 0.001f, "slats open");
+  check(std::strstr(cal.take_message(), "fully open") != nullptr, "says where it left the blind");
+
   // A cover command aborts it and that command runs.
   c.model.position = 0.5f;
   now += 1000;
@@ -531,6 +543,10 @@ static void test_limit_store() {
 
   // The cap: nothing holds both relays long enough to reach the factory reset.
   {
+    now += 1000;
+    c.request_position(now, 0.0f);  // a full run gives the model a true position after the store
+    now = run_motor(c, now, 3000);
+    c.take_run_end();
     LimitSequence seq;
     c.model.position = 0.2f;
     c.model.tilt = 0.0f;
@@ -565,7 +581,7 @@ static void test_limit_store() {
     c.tick(now);
   }
 
-  // A second limit straight after a store parks down into the new limit, then carries on up.
+  // After a store the height is unknown, so parking finds the limit first and reaches true mid-height.
   {
     LimitSequence seq;
     c.model.position = 0.5f;
@@ -573,23 +589,57 @@ static void test_limit_store() {
     c.mark_position_unknown();
     now += 1000;
     seq.start(now, LimitKind::UPPER, c);
-    now += 10;
-    c.tick(now);
-    for (int i = 0; i < 300 && c.relay_down(); i++) {
+    check(c.relay_down(), "goes down to find the limit first");
+    uint32_t t0 = now;
+    while (c.relay_down() && now < t0 + 60000) {
       now += 10;
       c.tick(now);
-      if (i % 50 == 49)
-        c.on_power(now, Direction::DOWN, i < 100 ? 100.0f : 0.5f);
+      if ((now - t0) % 500 == 0)
+        c.on_power(now, Direction::DOWN, now - t0 < 3000 ? 100.0f : 0.5f);
     }
-    check(!c.relay_down(), "the new limit stops the parking move");
+    check(!c.relay_down(), "the limit stops it");
+    near(c.model.position, 0.0f, 0.001f, "position is true again");
     now = limit_step(c, seq, now, 700);
     check(seq.active() && c.relay_up(), "parking continues upward");
-    now = limit_step(c, seq, now, 40000);
-    near(c.model.position, 0.5f, 0.001f, "parked at mid height");
+    while (c.relay_up() && now < t0 + 100000)
+      now = limit_step(c, seq, now, 10);
+    near(c.model.position, 0.5f, 0.001f, "parked at true mid height");
     check(seq.active(), "on its way to setting mode");
     seq.cancel(now, c);
     now = limit_step(c, seq, now, 100);
     seq.take_message();
+    c.model.position = 0.5f;
+    c.request_position(now, 0.0f);
+    now = run_motor(c, now, 3000);
+    c.take_run_end();
+  }
+
+  // After a cancel inside setting mode, nothing is pressed until the motor is entered again.
+  {
+    LimitSequence seq;
+    c.model.position = 0.2f;
+    c.model.tilt = 0.0f;
+    now += 1000;
+    now = limit_enter(c, seq, now, LimitKind::LOWER);
+    now = limit_step(c, seq, now, 1000);
+    seq.cancel(now, c);
+    seq.take_message();
+    now += 1000;
+    seq.start(now, LimitKind::LOWER, c);
+    check(!c.relay_up() && !c.relay_down(), "no parking move after a cancel in setting mode");
+    check(std::strstr(seq.take_message(), "stays put") != nullptr, "says why it isn't parking");
+    now = limit_step(c, seq, now, LIMIT_PARK_PAUSE_MS - 20);
+    check(!seq.relay_up() && !c.relay_up() && !c.relay_down(), "still pressing nothing");
+    now = limit_step(c, seq, now, 40);
+    check(seq.relay_up() && seq.relay_down(), "enters again after the pause");
+    now = limit_step(c, seq, now, LIMIT_ENTRY_HOLD_MS + 100, 100.0f);
+    check(seq.ready() && !seq.can_store(), "ready, but no store before a move");
+    seq.cancel(now, c);
+    seq.take_message();
+    c.model.position = 0.5f;
+    c.request_position(now, 0.0f);
+    now = run_motor(c, now, 3000);
+    c.take_run_end();
   }
 
   // Stop during parking ends it without touching the motor's settings.

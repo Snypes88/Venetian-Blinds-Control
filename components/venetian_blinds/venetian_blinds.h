@@ -110,6 +110,7 @@ class VenetianBlinds : public Component, public cover::Cover {
   uint32_t service_from_{0};
   uint32_t meter_idle_ms_{0};
   uint32_t meter_interval_ms_{0};
+  uint32_t meter_fast_until_{0};
   const char *status_{nullptr};
 
   output::BinaryOutput *up_output_{nullptr};

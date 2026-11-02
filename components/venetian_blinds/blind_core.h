@@ -201,6 +201,7 @@ class MotionController {
   // The model can't say where the blind is after the limit sequence moved it, so the next stop
   // counts wherever it comes.
   void mark_position_unknown() { position_unknown_ = true; }
+  bool position_unknown() const { return position_unknown_; }
   // The limit sequence drove the relays itself, so the reversal gap has to count from then.
   void note_external_release(uint32_t now) {
     has_run_ = true;
@@ -418,6 +419,7 @@ class TravelCalibration {
 
   void start(uint32_t now, MotionController &ctrl) {
     ctrl.take_run_end();  // an earlier run's end isn't ours
+    return_after_ = !ctrl.position_unknown();
     saved_position_ = ctrl.model.position;
     saved_tilt_ = ctrl.model.tilt;
     step_ = Step::TO_TOP;
@@ -505,6 +507,11 @@ class TravelCalibration {
       return fail_("Calibration rejected: measured times are not plausible, times unchanged");
     ctrl.timing = candidate;
     timing_changed_ = true;
+    if (!return_after_) {
+      step_ = Step::IDLE;
+      message_ = "Calibration done, blind left fully open";
+      return;
+    }
     if (std::fabs(saved_position_ - ctrl.model.position) < 0.001f)
       return return_tilt_(now, ctrl);
     step_ = Step::RETURN_POSITION;
@@ -525,6 +532,7 @@ class TravelCalibration {
   Step next_{Step::IDLE};
   const char *message_{nullptr};
   bool timing_changed_{false};
+  bool return_after_{true};
   float saved_position_{0.0f};
   float saved_tilt_{0.0f};
   uint32_t open_ms_{0};
@@ -551,7 +559,16 @@ class LimitSequence {
     ack_seen_ = false;
     driven_ = false;
     message_ = "Parking the blind";
-    if (ctrl.model.position >= PARK_LOW + 0.1f) {
+    if (maybe_in_setting_mode_) {
+      // The motor may still be in setting mode, where an up or down press means something else
+      // and a down run ignores the lower limit. Press nothing until it is entered again.
+      state_ = State::PARK_PAUSE;
+      state_from_ = now;
+      message_ = "Motor may be in setting mode, so the blind stays put. Waiting before entering again";
+    } else if (ctrl.position_unknown()) {
+      state_ = State::PARK_FIND_LIMIT;
+      ctrl.request_position(now, 0.0f);
+    } else if (ctrl.model.position >= PARK_LOW + 0.1f) {
       state_ = State::PARK_LOW;
       ctrl.request_position(now, PARK_LOW);
     } else {
@@ -560,15 +577,13 @@ class LimitSequence {
     }
   }
   void on_run_end(uint32_t now, RunEnd end, MotionController &ctrl) {
-    if (state_ != State::PARK_LOW && state_ != State::PARK_HIGH)
+    if (!parking_() || state_ == State::PARK_PAUSE)
       return;
-    // Straight after a store the model is above the blind, so going down can meet the new limit.
-    // That is a true position to park up from.
-    const bool met_lower_limit = state_ == State::PARK_LOW && end == RunEnd::AT_LIMIT;
-    if (end != RunEnd::ARRIVED && !met_lower_limit) {
+    const RunEnd wanted = state_ == State::PARK_FIND_LIMIT ? RunEnd::AT_LIMIT : RunEnd::ARRIVED;
+    if (end != wanted) {
       state_ = State::IDLE;
       message_ = "Parking failed, motor limits unchanged";
-    } else if (state_ == State::PARK_LOW) {
+    } else if (state_ != State::PARK_HIGH) {
       state_ = State::PARK_HIGH;
       ctrl.request_position(now, PARK_HIGH);
     } else {
@@ -584,6 +599,7 @@ class LimitSequence {
           state_ = State::ENTERING;
           state_from_ = now;
           entry_attempted_ = true;
+          maybe_in_setting_mode_ = false;
           message_ = "Entering setting mode: both relays on";
         }
         break;
@@ -667,6 +683,7 @@ class LimitSequence {
     } else {
       message_ = entry_attempted_ ? "Cancelled. The motor may still be in setting mode: check before normal use"
                                   : "Cancelled, motor limits unchanged";
+      maybe_in_setting_mode_ = entry_attempted_;
       ctrl.mark_position_unknown();
       ctrl.note_external_release(now);
     }
@@ -677,6 +694,9 @@ class LimitSequence {
     message_ = nullptr;
     return message;
   }
+  // True once a limit can actually be moved, and whether a store would do anything.
+  bool ready() const { return state_ == State::READY; }
+  bool can_store() const { return ready() && driven_; }
   // Reports once that a store press has finished.
   bool take_store_finished() {
     const bool finished = store_finished_;
@@ -685,10 +705,23 @@ class LimitSequence {
   }
 
  private:
-  enum class State { IDLE, PARK_LOW, PARK_HIGH, PARK_PAUSE, ENTERING, READY, DRIVE_WAIT, DRIVING, STORE_WAIT, STORING };
+  enum class State {
+    IDLE,
+    PARK_FIND_LIMIT,
+    PARK_LOW,
+    PARK_HIGH,
+    PARK_PAUSE,
+    ENTERING,
+    READY,
+    DRIVE_WAIT,
+    DRIVING,
+    STORE_WAIT,
+    STORING
+  };
 
   bool parking_() const {
-    return state_ == State::PARK_LOW || state_ == State::PARK_HIGH || state_ == State::PARK_PAUSE;
+    return state_ == State::PARK_FIND_LIMIT || state_ == State::PARK_LOW || state_ == State::PARK_HIGH ||
+           state_ == State::PARK_PAUSE;
   }
   bool pressing_() const { return state_ == State::DRIVING || state_ == State::STORING; }
   void end_entry_(uint32_t now, const char *message) {
@@ -738,6 +771,7 @@ class LimitSequence {
   bool driven_{false};
   bool press_moved_{false};
   bool store_finished_{false};
+  bool maybe_in_setting_mode_{false};
   uint32_t state_from_{0};
   uint32_t last_off_{0};
   uint32_t press_limit_ms_{0};
